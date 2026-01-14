@@ -34,6 +34,10 @@ alias rpi_loc_update="cd $RPI_LOC_ROOT && git pull"
 # Activate the rpi_loc environment
 alias rpi_act="source $RPI_LOC_ENV/bin/activate"
 
+# Remove any conflicting alias before defining functions
+unalias rpi_loc 2>/dev/null
+unalias run_rpi_loc 2>/dev/null
+
 # Activate environment and run the image streamer
 rpi_loc() {
     source "$RPI_LOC_ENV/bin/activate"
