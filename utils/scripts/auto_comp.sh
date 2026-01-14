@@ -28,6 +28,9 @@ fi
 # Clone the rpi_loc repository
 alias rpi_loc_clone="cd $HOME && git clone https://github.com/dhavids/rpi_loc.git"
 
+# Update (pull) the rpi_loc repository
+alias rpi_loc_update="cd $RPI_LOC_ROOT && git pull"
+
 # Activate the rpi_loc environment
 alias rpi_act="source $RPI_LOC_ENV/bin/activate"
 
@@ -113,12 +116,14 @@ rpi_loc_help() {
     echo "RPi Localization Commands:"
     echo ""
     echo "  rpi_loc_clone  - Clone the rpi_loc repository from GitHub"
+    echo "  rpi_loc_update - Pull latest changes from GitHub"
     echo "  rpi_act        - Activate the rpi_loc virtual environment"
     echo "  rpi_loc        - Activate env and run image streamer (with args)"
     echo "  run_rpi_loc    - Run image streamer only (env must be active)"
     echo ""
     echo "Examples:"
     echo "  rpi_loc_clone                # Clone the repo"
+    echo "  rpi_loc_update               # Pull latest changes"
     echo "  rpi_loc --port 5000"
     echo "  rpi_loc --port 5000 --resolution 1280x720 --fps 15"
     echo "  rpi_loc --port 5000 --mock   # Test without camera"
