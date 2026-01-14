@@ -197,34 +197,40 @@ print_instructions() {
     echo -e "${GREEN}    Setup Complete!${NC}"
     echo -e "${GREEN}============================================${NC}"
     echo ""
-    echo -e "To activate the environment in the future, run:"
-    echo -e "  ${YELLOW}source ~/envs/rpi_loc/bin/activate${NC}"
+    echo -e "Available commands:"
+    echo -e "  ${YELLOW}rpi_act${NC}        - Activate the rpi_loc virtual environment"
+    echo -e "  ${YELLOW}rpi_loc${NC}        - Activate env and run image streamer"
+    echo -e "  ${YELLOW}run_rpi_loc${NC}    - Run image streamer (env must be active)"
+    echo -e "  ${YELLOW}rpi_loc_help${NC}   - Show help for all commands"
     echo ""
-    echo -e "Or add this alias to your ~/.bashrc:"
-    echo -e "  ${YELLOW}alias rpi_loc='source ~/envs/rpi_loc/bin/activate'${NC}"
+    echo -e "Examples:"
+    echo -e "  ${YELLOW}rpi_loc --port 5000${NC}"
+    echo -e "  ${YELLOW}rpi_loc --port 5000 --resolution 1280x720${NC}"
+    echo -e "  ${YELLOW}rpi_loc --port 5000 --mock${NC}  # Test without camera"
     echo ""
-    echo -e "To run the image streamer:"
-    echo -e "  ${YELLOW}cd $REPO_ROOT${NC}"
-    echo -e "  ${YELLOW}python src/image_streamer.py --port 5000${NC}"
-    echo ""
-    echo -e "For testing without a camera:"
-    echo -e "  ${YELLOW}python src/image_streamer.py --port 5000 --mock${NC}"
+    echo -e "Auto-completion is available - press TAB after typing options!"
     echo ""
 }
 
 # Add convenience alias to bashrc
 add_alias() {
-    ALIAS_LINE="alias rpi_loc='source ~/envs/rpi_loc/bin/activate && cd $REPO_ROOT'"
+    AUTO_COMP_PATH="$SCRIPT_DIR/auto_comp.sh"
+    SOURCE_LINE="source $AUTO_COMP_PATH"
     
-    if ! grep -q "alias rpi_loc=" "$HOME/.bashrc" 2>/dev/null; then
-        print_info "Adding convenience alias to ~/.bashrc..."
+    if ! grep -q "auto_comp.sh" "$HOME/.bashrc" 2>/dev/null; then
+        print_info "Adding auto-completion script to ~/.bashrc..."
         echo "" >> "$HOME/.bashrc"
-        echo "# RPi Localization environment alias" >> "$HOME/.bashrc"
-        echo "$ALIAS_LINE" >> "$HOME/.bashrc"
-        print_status "Alias 'rpi_loc' added to ~/.bashrc"
+        echo "# RPi Localization auto-completion and aliases" >> "$HOME/.bashrc"
+        echo "if [ -f \"$AUTO_COMP_PATH\" ]; then" >> "$HOME/.bashrc"
+        echo "    source \"$AUTO_COMP_PATH\"" >> "$HOME/.bashrc"
+        echo "fi" >> "$HOME/.bashrc"
+        print_status "Auto-completion script added to ~/.bashrc"
     else
-        print_status "Alias already exists in ~/.bashrc"
+        print_status "Auto-completion already configured in ~/.bashrc"
     fi
+    
+    # Source it now for current shell
+    source "$AUTO_COMP_PATH"
 }
 
 # Main execution
