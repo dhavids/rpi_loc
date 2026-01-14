@@ -26,7 +26,7 @@ fi
 # =============================================================================
 
 # Clone the rpi_loc repository
-alias rpi_loc_clone="git clone https://github.com/dhavids/rpi_loc.git"
+alias rpi_loc_clone="cd $HOME && git clone https://github.com/dhavids/rpi_loc.git"
 
 # Activate the rpi_loc environment
 alias rpi_act="source $RPI_LOC_ENV/bin/activate"
