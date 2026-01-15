@@ -5,14 +5,19 @@ CLI for YOLO TurtleBot Detection Training
 Provides command-line interface for:
 - Collecting training images
 - Annotating images
+- Creating datasets
 - Training/fine-tuning models
 - Evaluating models
 
 Usage:
     python -m rpi_loc.src.models.yolo.cli collect --camera 0 --output data/images
     python -m rpi_loc.src.models.yolo.cli annotate --images data/images --labels data/labels
+    python -m rpi_loc.src.models.yolo.cli create-dataset --images data/images --labels data/labels --output data/dataset
     python -m rpi_loc.src.models.yolo.cli train --data data/dataset --epochs 100
+    python -m rpi_loc.src.models.yolo.cli finetune --data data/dataset --base-model yolov8n.pt --epochs 50
     python -m rpi_loc.src.models.yolo.cli evaluate --model runs/train/best.pt --data data/dataset
+    python -m rpi_loc.src.models.yolo.cli predict --model runs/train/best.pt --source test_images/
+    python -m rpi_loc.src.models.yolo.cli export --model runs/train/best.pt --format onnx
 """
 
 import argparse
@@ -93,6 +98,14 @@ def cmd_create_dataset(args):
     class_names = args.classes.split(",") if args.classes else ["turtlebot"]
     
     manager = DatasetManager(args.output, class_names)
+    
+    # If no images/labels provided, just create empty structure
+    if not args.images or not args.labels:
+        manager.create_structure()
+        manager.create_data_yaml()
+        print(f"\nEmpty dataset structure created at {args.output}")
+        print("  Add images to train/images/ and labels to train/labels/")
+        return
     
     counts = manager.split_dataset(
         images_folder=args.images,
@@ -267,8 +280,8 @@ def main():
     
     # Create dataset command
     p_dataset = subparsers.add_parser("create-dataset", help="Create train/val/test split")
-    p_dataset.add_argument("--images", "-i", required=True, help="Images directory")
-    p_dataset.add_argument("--labels", "-l", required=True, help="Labels directory")
+    p_dataset.add_argument("--images", "-i", help="Images directory (optional if creating empty structure)")
+    p_dataset.add_argument("--labels", "-l", help="Labels directory (optional if creating empty structure)")
     p_dataset.add_argument("--output", "-o", required=True, help="Output dataset directory")
     p_dataset.add_argument("--classes", "-c", default="turtlebot", help="Comma-separated class names")
     p_dataset.add_argument("--train-ratio", type=float, default=0.8)
