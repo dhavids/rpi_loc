@@ -50,6 +50,102 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def get_pi_power_stats() -> dict:
+    """
+    Get Raspberry Pi power statistics using vcgencmd.
+    
+    Returns dict with:
+        - voltage: Core voltage (V)
+        - throttled: Throttling status flags
+        - temp: CPU temperature (°C)
+        - under_voltage: True if under-voltage detected
+        - freq_capped: True if frequency capped
+        - throttled_now: True if currently throttled
+    """
+    import subprocess
+    
+    stats = {
+        'voltage': None,
+        'temp': None,
+        'throttled': None,
+        'under_voltage': False,
+        'freq_capped': False,
+        'throttled_now': False,
+        'under_voltage_occurred': False,
+    }
+    
+    try:
+        # Get core voltage
+        result = subprocess.run(['vcgencmd', 'measure_volts', 'core'], 
+                              capture_output=True, text=True, timeout=1)
+        if result.returncode == 0:
+            # Output: volt=1.2000V
+            voltage_str = result.stdout.strip().split('=')[1].rstrip('V')
+            stats['voltage'] = float(voltage_str)
+        
+        # Get temperature
+        result = subprocess.run(['vcgencmd', 'measure_temp'], 
+                              capture_output=True, text=True, timeout=1)
+        if result.returncode == 0:
+            # Output: temp=45.0'C
+            temp_str = result.stdout.strip().split('=')[1].rstrip("'C")
+            stats['temp'] = float(temp_str)
+        
+        # Get throttling status
+        result = subprocess.run(['vcgencmd', 'get_throttled'], 
+                              capture_output=True, text=True, timeout=1)
+        if result.returncode == 0:
+            # Output: throttled=0x0
+            throttled_hex = result.stdout.strip().split('=')[1]
+            throttled = int(throttled_hex, 16)
+            stats['throttled'] = throttled_hex
+            
+            # Decode throttling flags
+            # Bit 0: Under-voltage detected
+            # Bit 1: Arm frequency capped
+            # Bit 2: Currently throttled
+            # Bit 16: Under-voltage has occurred
+            # Bit 17: Arm frequency capping has occurred
+            # Bit 18: Throttling has occurred
+            stats['under_voltage'] = bool(throttled & 0x1)
+            stats['freq_capped'] = bool(throttled & 0x2)
+            stats['throttled_now'] = bool(throttled & 0x4)
+            stats['under_voltage_occurred'] = bool(throttled & 0x10000)
+            
+    except FileNotFoundError:
+        logger.debug("vcgencmd not found - not running on Raspberry Pi?")
+    except Exception as e:
+        logger.debug(f"Failed to get power stats: {e}")
+    
+    return stats
+
+
+def format_power_status(stats: dict) -> str:
+    """Format power stats for logging."""
+    parts = []
+    
+    if stats['voltage'] is not None:
+        parts.append(f"Voltage: {stats['voltage']:.2f}V")
+    
+    if stats['temp'] is not None:
+        parts.append(f"Temp: {stats['temp']:.1f}°C")
+    
+    warnings = []
+    if stats['under_voltage']:
+        warnings.append("⚠️ UNDER-VOLTAGE!")
+    if stats['freq_capped']:
+        warnings.append("⚠️ FREQ CAPPED!")
+    if stats['throttled_now']:
+        warnings.append("⚠️ THROTTLED!")
+    if stats['under_voltage_occurred']:
+        warnings.append("(under-voltage occurred)")
+    
+    if warnings:
+        parts.append(" ".join(warnings))
+    
+    return " | ".join(parts) if parts else "Power stats unavailable"
+
+
 # Common sensor resolutions for IMX708 (RPi Camera Module 3 Wide)
 IMX708_MODES = {
     "full": (4608, 2592),      # Full resolution (9MP)
@@ -312,9 +408,28 @@ class ImageStreamer:
     def _stream_loop(self):
         """Main loop for capturing and streaming frames."""
         frame_interval = 1.0 / self.config.fps
+        last_power_check = 0
+        power_check_interval = 5.0  # Check power every 5 seconds
+        
+        # Initial power check
+        stats = get_pi_power_stats()
+        logger.info(f"Power status: {format_power_status(stats)}")
         
         while self._running:
             start_time = time.time()
+            
+            # Periodic power monitoring
+            if start_time - last_power_check >= power_check_interval:
+                stats = get_pi_power_stats()
+                status_str = format_power_status(stats)
+                
+                # Always log if there's a warning, otherwise log periodically
+                if stats['under_voltage'] or stats['throttled_now'] or stats['freq_capped']:
+                    logger.warning(f"Power issue detected! {status_str}")
+                else:
+                    logger.info(f"Power status: {status_str}")
+                
+                last_power_check = start_time
             
             # Capture frame
             image_data = self.camera.capture_jpeg(self.config.quality)
