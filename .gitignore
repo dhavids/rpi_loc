@@ -9,6 +9,10 @@ __pycache__/
 # Ignore data folder
 data/
 
+# Ignore .pt model files
+*.pt
+*.pth
+
 # Distribution / packaging
 .Python
 build/
