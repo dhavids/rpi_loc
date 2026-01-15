@@ -204,8 +204,14 @@ class CameraCapture:
             # Log actual configuration
             camera_config = self.camera.camera_configuration()
             sensor_size = camera_config.get('sensor', {}).get('output_size', 'unknown')
+            main_format = camera_config.get('main', {}).get('format', 'unknown')
             logger.info(f"Sensor mode: {sensor_size}")
+            logger.info(f"Main stream format: {main_format}")
             logger.info(f"Camera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps (Full FOV: {self.full_fov})")
+            
+            # Store the format for color conversion decisions
+            self._format = main_format
+            
             self._running = True
             return True
             
@@ -234,8 +240,22 @@ class CameraCapture:
         if frame is None:
             return None
         
-        # Convert RGB to BGR for OpenCV
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # Handle color conversion based on actual format from picamera2
+        # XBGR8888/XRGB8888 are common outputs - need to convert properly
+        fmt = getattr(self, '_format', 'RGB888')
+        
+        if 'BGR' in str(fmt) or 'XBGR' in str(fmt):
+            # Already BGR-ish, may need to strip alpha but no RGB swap needed
+            if frame.shape[2] == 4:  # XBGR8888 has 4 channels
+                frame_bgr = frame[:, :, :3]  # Drop alpha, keep BGR
+            else:
+                frame_bgr = frame
+        else:
+            # RGB format - convert to BGR for OpenCV
+            if frame.shape[2] == 4:  # XRGB8888
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            else:  # RGB888
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
         # Crop to square if requested
         if self.crop_square > 0:

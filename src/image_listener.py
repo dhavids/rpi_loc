@@ -62,7 +62,8 @@ class ImageListener:
         on_frame: Optional[Callable[[np.ndarray, Dict[str, Any]], None]] = None,
         window_name: str = None,
         max_display_width: int = 1280,
-        max_display_height: int = 720
+        max_display_height: int = 720,
+        show_overlay: bool = False
     ):
         """
         Initialize the ImageListener.
@@ -76,6 +77,7 @@ class ImageListener:
             window_name: Custom window name for display
             max_display_width: Maximum display window width (scales down if larger)
             max_display_height: Maximum display window height (scales down if larger)
+            show_overlay: Whether to show text overlay on display
         """
         self.host = host
         self.port = port
@@ -85,6 +87,7 @@ class ImageListener:
         self.window_name = window_name
         self.max_display_width = max_display_width
         self.max_display_height = max_display_height
+        self.show_overlay = show_overlay
         
         self._socket: Optional[socket.socket] = None
         self._running = False
@@ -284,6 +287,11 @@ class ImageListener:
         """
         # First scale to fit display
         display_frame = self._scale_to_fit(frame)
+        
+        # Return early if overlay is disabled
+        if not self.show_overlay:
+            return display_frame
+        
         h, w = display_frame.shape[:2]
         
         # Scale overlay elements based on frame size
@@ -413,6 +421,8 @@ Controls (when display is enabled):
                        help="Maximum display width - scales down if larger (default: 1280)")
     parser.add_argument("--max-height", type=int, default=720,
                        help="Maximum display height - scales down if larger (default: 720)")
+    parser.add_argument("--show-overlay", action="store_true",
+                       help="Show text overlay on display")
     
     args = parser.parse_args()
     
@@ -432,7 +442,8 @@ Controls (when display is enabled):
         save_dir=args.save,
         window_name=args.window_name,
         max_display_width=args.max_width,
-        max_display_height=args.max_height
+        max_display_height=args.max_height,
+        show_overlay=args.show_overlay
     )
     
     listener.start(
