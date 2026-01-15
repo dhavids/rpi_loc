@@ -60,7 +60,9 @@ class ImageListener:
         display: bool = True,
         save_dir: str = None,
         on_frame: Optional[Callable[[np.ndarray, Dict[str, Any]], None]] = None,
-        window_name: str = None
+        window_name: str = None,
+        max_display_width: int = 1280,
+        max_display_height: int = 720
     ):
         """
         Initialize the ImageListener.
@@ -72,6 +74,8 @@ class ImageListener:
             save_dir: Directory to save frames (None to disable saving)
             on_frame: Callback function(frame, metadata) for custom processing
             window_name: Custom window name for display
+            max_display_width: Maximum display window width (scales down if larger)
+            max_display_height: Maximum display window height (scales down if larger)
         """
         self.host = host
         self.port = port
@@ -79,6 +83,8 @@ class ImageListener:
         self.save_dir = save_dir
         self.on_frame = on_frame
         self.window_name = window_name
+        self.max_display_width = max_display_width
+        self.max_display_height = max_display_height
         
         self._socket: Optional[socket.socket] = None
         self._running = False
@@ -237,6 +243,34 @@ class ImageListener:
             
             self._frame_count += 1
     
+    def _scale_to_fit(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Scale frame to fit within max display dimensions while maintaining aspect ratio.
+        
+        Args:
+            frame: Original frame
+            
+        Returns:
+            Scaled frame that fits within max_display_width x max_display_height
+        """
+        h, w = frame.shape[:2]
+        
+        # Check if scaling is needed
+        if w <= self.max_display_width and h <= self.max_display_height:
+            return frame
+        
+        # Calculate scale factor to fit within bounds
+        scale_w = self.max_display_width / w
+        scale_h = self.max_display_height / h
+        scale = min(scale_w, scale_h)
+        
+        # Calculate new dimensions
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize with high quality interpolation
+        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
     def _prepare_display_frame(self, frame: np.ndarray, metadata: dict) -> np.ndarray:
         """
         Prepare frame for display with overlay information.
@@ -246,32 +280,42 @@ class ImageListener:
             metadata: Frame metadata
         
         Returns:
-            Frame with overlay
+            Frame with overlay, scaled to fit display
         """
-        display_frame = frame.copy()
+        # First scale to fit display
+        display_frame = self._scale_to_fit(frame)
+        h, w = display_frame.shape[:2]
         
+        # Scale overlay elements based on frame size
+        scale_factor = min(w / 640, h / 480)  # Reference size for scaling UI
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
+        font_scale = max(0.4, 0.5 * scale_factor)
         color = (0, 255, 0)
-        thickness = 1
+        thickness = max(1, int(scale_factor))
         
         # Add semi-transparent background for text
         overlay = display_frame.copy()
-        cv2.rectangle(overlay, (5, 5), (300, 110), (0, 0, 0), -1)
+        box_width = int(250 * scale_factor)
+        box_height = int(110 * scale_factor)
+        cv2.rectangle(overlay, (5, 5), (5 + box_width, 5 + box_height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.5, display_frame, 0.5, 0, display_frame)
         
-        y_offset = 25
+        # Get original resolution for display
+        orig_h, orig_w = frame.shape[:2]
+        
+        y_offset = int(25 * scale_factor)
+        line_spacing = int(18 * scale_factor)
         texts = [
             f"Device: {metadata.get('device_id', 'unknown')}",
             f"Frame: {metadata.get('frame_number', '?')}",
+            f"Res: {orig_w}x{orig_h} -> {w}x{h}",
             f"Time: {metadata.get('timestamp', '?')[:19]}",
-            f"IP: {metadata.get('ip_address', '?')}",
             f"FPS: {self._fps:.1f}"
         ]
         
         for text in texts:
             cv2.putText(display_frame, text, (10, y_offset), font, font_scale, color, thickness)
-            y_offset += 18
+            y_offset += line_spacing
         
         return display_frame
     
@@ -365,6 +409,10 @@ Controls (when display is enabled):
                        help="Delay between reconnection attempts (default: 5.0)")
     parser.add_argument("--window-name", type=str, default=None,
                        help="Custom window name")
+    parser.add_argument("--max-width", type=int, default=1280,
+                       help="Maximum display width - scales down if larger (default: 1280)")
+    parser.add_argument("--max-height", type=int, default=720,
+                       help="Maximum display height - scales down if larger (default: 720)")
     
     args = parser.parse_args()
     
@@ -382,7 +430,9 @@ Controls (when display is enabled):
         port=args.port,
         display=not args.no_display,
         save_dir=args.save,
-        window_name=args.window_name
+        window_name=args.window_name,
+        max_display_width=args.max_width,
+        max_display_height=args.max_height
     )
     
     listener.start(

@@ -63,10 +63,11 @@ IMX708_MODES = {
 class CameraCapture:
     """Handles camera capture on Raspberry Pi using picamera2."""
     
-    def __init__(self, resolution: tuple = (640, 480), fps: int = 30, full_fov: bool = True):
+    def __init__(self, resolution: tuple = (640, 480), fps: int = 30, full_fov: bool = True, crop_square: int = 0):
         self.resolution = resolution
         self.fps = fps
         self.full_fov = full_fov  # Use full field of view (wide angle)
+        self.crop_square = crop_square  # If > 0, crop to this square size from center
         self.camera = None
         self._running = False
         
@@ -140,6 +141,10 @@ class CameraCapture:
         # Convert RGB to BGR for OpenCV
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
+        # Crop to square if requested
+        if self.crop_square > 0:
+            frame_bgr = self._crop_center_square(frame_bgr, self.crop_square)
+        
         # Encode as JPEG
         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
         success, encoded = cv2.imencode('.jpg', frame_bgr, encode_param)
@@ -147,6 +152,22 @@ class CameraCapture:
         if success:
             return encoded.tobytes()
         return None
+    
+    def _crop_center_square(self, frame: np.ndarray, size: int) -> np.ndarray:
+        """Crop a square from the center of the frame."""
+        h, w = frame.shape[:2]
+        
+        # Calculate crop region (center)
+        cx, cy = w // 2, h // 2
+        half = size // 2
+        
+        # Ensure we don't exceed frame bounds
+        x1 = max(0, cx - half)
+        y1 = max(0, cy - half)
+        x2 = min(w, x1 + size)
+        y2 = min(h, y1 + size)
+        
+        return frame[y1:y2, x1:x2]
     
     def close(self):
         """Close the camera."""
@@ -234,7 +255,8 @@ class ImageStreamer:
             self.camera = CameraCapture(
                 self.config.resolution, 
                 self.config.fps,
-                full_fov=getattr(self.config, 'full_fov', True)
+                full_fov=getattr(self.config, 'full_fov', True),
+                crop_square=getattr(self.config, 'crop_square', 0)
             )
         
         if not self.camera.initialize():
@@ -375,6 +397,7 @@ def main():
         epilog="""
 Resolution Modes:
     --full      4608x2592 @ 10fps  (9MP, maximum detail)
+    --2500      2500x2500 @ 10fps  (square crop from full sensor)
     --binned    2304x1296 @ 20fps  (2x2 binned, good balance)
     --1080      1920x1080 @ 30fps  (default)
     --720       1280x720  @ 30fps
@@ -421,6 +444,8 @@ Note:
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--full", action="store_true",
                            help="Full resolution 4608x2592 @ 10fps (max detail)")
+    mode_group.add_argument("--2500", dest="mode_2500", action="store_true",
+                           help="2500x2500 square @ 10fps (cropped from full sensor)")
     mode_group.add_argument("--binned", action="store_true",
                            help="2x2 binned 2304x1296 @ 20fps (good balance)")
     mode_group.add_argument("--1080", "--1080p", dest="mode_1080", action="store_true",
@@ -433,8 +458,14 @@ Note:
     args = parser.parse_args()
     
     # Determine resolution and fps from mode or explicit args
+    crop_square = 0  # No square cropping by default
+    
     if args.full:
         resolution = (4608, 2592)
+        default_fps = 10
+    elif args.mode_2500:
+        resolution = (4608, 2592)  # Capture at full, then crop
+        crop_square = 2500
         default_fps = 10
     elif args.binned:
         resolution = (2304, 1296)
@@ -485,8 +516,12 @@ Note:
     )
     # Always use full FOV to preserve wide angle
     config.full_fov = True
+    config.crop_square = crop_square
     
-    logger.info(f"Mode: {resolution[0]}x{resolution[1]} @ {fps}fps")
+    if crop_square > 0:
+        logger.info(f"Mode: {resolution[0]}x{resolution[1]} -> {crop_square}x{crop_square} (square crop) @ {fps}fps")
+    else:
+        logger.info(f"Mode: {resolution[0]}x{resolution[1]} @ {fps}fps")
     
     streamer = ImageStreamer(config, device_id=args.device_id, mock=args.mock)
     streamer.start()
