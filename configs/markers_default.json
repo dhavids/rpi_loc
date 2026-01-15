@@ -1,0 +1,28 @@
+{
+    "description": "Default marker configuration for TurtleBot localization",
+    "coordinate_system": {
+        "origin": "bottom-left corner",
+        "x_axis": "right",
+        "y_axis": "up",
+        "units": "meters"
+    },
+    "reference_markers": [
+        {"id": 0, "x": 0.0, "y": 0.0, "description": "Origin - bottom-left"},
+        {"id": 1, "x": 2.0, "y": 0.0, "description": "Bottom-right"},
+        {"id": 2, "x": 2.0, "y": 2.0, "description": "Top-right"},
+        {"id": 3, "x": 0.0, "y": 2.0, "description": "Top-left"}
+    ],
+    "turtlebot_markers": [
+        {"id": 10, "name": "tb3_0"},
+        {"id": 11, "name": "tb3_1"},
+        {"id": 12, "name": "tb3_2"}
+    ],
+    "aruco_dictionary": "DICT_4X4_50",
+    "marker_size_meters": 0.05,
+    "notes": [
+        "Reference markers should be placed at fixed, measured positions",
+        "TurtleBot markers should be mounted on top of each robot",
+        "Ensure markers are flat and perpendicular to camera view",
+        "Minimum 4 reference markers required for homography"
+    ]
+}

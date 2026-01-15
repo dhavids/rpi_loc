@@ -50,12 +50,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Common sensor resolutions for IMX708 (RPi Camera Module 3 Wide)
+IMX708_MODES = {
+    "full": (4608, 2592),      # Full resolution (9MP)
+    "2x2_binned": (2304, 1296), # 2x2 binned (3MP) - good balance
+    "1080p": (1920, 1080),      # 1080p
+    "720p": (1280, 720),        # 720p
+    "480p": (640, 480),         # VGA
+}
+
+
 class CameraCapture:
     """Handles camera capture on Raspberry Pi using picamera2."""
     
-    def __init__(self, resolution: tuple = (640, 480), fps: int = 30):
+    def __init__(self, resolution: tuple = (640, 480), fps: int = 30, full_fov: bool = True):
         self.resolution = resolution
         self.fps = fps
+        self.full_fov = full_fov  # Use full field of view (wide angle)
         self.camera = None
         self._running = False
         
@@ -66,17 +77,38 @@ class CameraCapture:
             
             self.camera = Picamera2()
             
+            # Get sensor modes to find the best one for full FOV
+            sensor_modes = self.camera.sensor_modes
+            logger.info(f"Available sensor modes: {len(sensor_modes)}")
+            for i, mode in enumerate(sensor_modes):
+                logger.info(f"  Mode {i}: {mode}")
+            
             # Configure camera
-            config = self.camera.create_preview_configuration(
-                main={"size": self.resolution, "format": "RGB888"}
-            )
+            # Use full sensor mode for maximum wide angle coverage
+            if self.full_fov:
+                # Use full sensor readout, then scale down to output resolution
+                # This preserves the full wide-angle field of view
+                config = self.camera.create_preview_configuration(
+                    main={"size": self.resolution, "format": "RGB888"},
+                    sensor={"output_size": IMX708_MODES["full"], "bit_depth": 10},
+                    buffer_count=2
+                )
+            else:
+                config = self.camera.create_preview_configuration(
+                    main={"size": self.resolution, "format": "RGB888"}
+                )
+            
             self.camera.configure(config)
             self.camera.start()
             
             # Allow camera to warm up
             time.sleep(2)
             
-            logger.info(f"Camera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps")
+            # Log actual configuration
+            camera_config = self.camera.camera_configuration()
+            sensor_size = camera_config.get('sensor', {}).get('output_size', 'unknown')
+            logger.info(f"Sensor mode: {sensor_size}")
+            logger.info(f"Camera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps (Full FOV: {self.full_fov})")
             self._running = True
             return True
             
@@ -199,7 +231,11 @@ class ImageStreamer:
         if self.mock:
             self.camera = MockCameraCapture(self.config.resolution, self.config.fps)
         else:
-            self.camera = CameraCapture(self.config.resolution, self.config.fps)
+            self.camera = CameraCapture(
+                self.config.resolution, 
+                self.config.fps,
+                full_fov=getattr(self.config, 'full_fov', True)
+            )
         
         if not self.camera.initialize():
             logger.error("Failed to initialize camera")
@@ -337,17 +373,31 @@ def main():
         description="Raspberry Pi Camera Image Streamer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Resolution Modes:
+    --full      4608x2592 @ 10fps  (9MP, maximum detail)
+    --binned    2304x1296 @ 20fps  (2x2 binned, good balance)
+    --1080      1920x1080 @ 30fps  (default)
+    --720       1280x720  @ 30fps
+    --480       640x480   @ 30fps
+
 Examples:
-    Start streamer on Raspberry Pi:
-        python image_streamer.py --port 5000
+    # Default 1080p streaming
+    python image_streamer.py --port 5000
     
-    Start streamer with custom resolution:
-        python image_streamer.py --port 5000 --resolution 1280x720 --fps 15
+    # Full resolution for maximum detail
+    python image_streamer.py --full
     
-    Start streamer with mock camera (for testing):
-        python image_streamer.py --port 5000 --mock
+    # 2x2 binned for good quality + performance
+    python image_streamer.py --binned
+    
+    # Custom resolution
+    python image_streamer.py --resolution 3840x2160 --fps 5
+    
+    # Mock camera for testing
+    python image_streamer.py --mock --720
 
 Note:
+    All modes use full sensor readout to preserve the wide-angle FOV.
     For receiving images, use image_listener.py on the receiving machine.
         """
     )
@@ -356,10 +406,10 @@ Note:
                        help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5000,
                        help="Port number (default: 5000)")
-    parser.add_argument("--resolution", type=str, default="640x480",
-                       help="Camera resolution WxH (default: 640x480)")
-    parser.add_argument("--fps", type=int, default=30,
-                       help="Frames per second (default: 30)")
+    parser.add_argument("--resolution", type=str, default=None,
+                       help="Output resolution WxH (overrides preset modes)")
+    parser.add_argument("--fps", type=int, default=None,
+                       help="Frames per second (default depends on mode)")
     parser.add_argument("--quality", type=int, default=85,
                        help="JPEG quality 1-100 (default: 85)")
     parser.add_argument("--device-id", type=str, default=None,
@@ -367,15 +417,51 @@ Note:
     parser.add_argument("--mock", action="store_true",
                        help="Use mock camera for testing")
     
+    # Resolution presets (mutually exclusive)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--full", action="store_true",
+                           help="Full resolution 4608x2592 @ 10fps (max detail)")
+    mode_group.add_argument("--binned", action="store_true",
+                           help="2x2 binned 2304x1296 @ 20fps (good balance)")
+    mode_group.add_argument("--1080", "--1080p", dest="mode_1080", action="store_true",
+                           help="1920x1080 @ 30fps")
+    mode_group.add_argument("--720", "--720p", dest="mode_720", action="store_true",
+                           help="1280x720 @ 30fps")
+    mode_group.add_argument("--480", "--480p", dest="mode_480", action="store_true",
+                           help="640x480 @ 30fps")
+    
     args = parser.parse_args()
     
-    # Parse resolution
-    try:
-        width, height = map(int, args.resolution.split('x'))
-        resolution = (width, height)
-    except ValueError:
-        logger.error(f"Invalid resolution format: {args.resolution}")
-        sys.exit(1)
+    # Determine resolution and fps from mode or explicit args
+    if args.full:
+        resolution = (4608, 2592)
+        default_fps = 10
+    elif args.binned:
+        resolution = (2304, 1296)
+        default_fps = 20
+    elif args.mode_1080:
+        resolution = (1920, 1080)
+        default_fps = 30
+    elif args.mode_720:
+        resolution = (1280, 720)
+        default_fps = 30
+    elif args.mode_480:
+        resolution = (640, 480)
+        default_fps = 30
+    elif args.resolution:
+        try:
+            width, height = map(int, args.resolution.split('x'))
+            resolution = (width, height)
+        except ValueError:
+            logger.error(f"Invalid resolution format: {args.resolution}")
+            sys.exit(1)
+        default_fps = 30
+    else:
+        # Default to 1080p
+        resolution = (1920, 1080)
+        default_fps = 30
+    
+    fps = args.fps if args.fps else default_fps
     
     # Setup signal handlers
     streamer = None
@@ -394,9 +480,13 @@ Note:
         host=args.host,
         port=args.port,
         resolution=resolution,
-        fps=args.fps,
+        fps=fps,
         quality=args.quality
     )
+    # Always use full FOV to preserve wide angle
+    config.full_fov = True
+    
+    logger.info(f"Mode: {resolution[0]}x{resolution[1]} @ {fps}fps")
     
     streamer = ImageStreamer(config, device_id=args.device_id, mock=args.mock)
     streamer.start()

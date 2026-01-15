@@ -351,8 +351,8 @@ Controls (when display is enabled):
         """
     )
     
-    parser.add_argument("--host", required=True,
-                       help="Streamer host address (Tailscale IP)")
+    parser.add_argument("--host", default="100.99.98.1",
+                       help="Streamer host address (default: 100.99.98.1)")
     parser.add_argument("--port", type=int, default=5000,
                        help="Streamer port number (default: 5000)")
     parser.add_argument("--save", type=str, default=None,
