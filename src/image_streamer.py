@@ -240,22 +240,12 @@ class CameraCapture:
         if frame is None:
             return None
         
-        # Handle color conversion based on actual format from picamera2
-        # XBGR8888/XRGB8888 are common outputs - need to convert properly
-        fmt = getattr(self, '_format', 'RGB888')
-        
-        if 'BGR' in str(fmt) or 'XBGR' in str(fmt):
-            # Already BGR-ish, may need to strip alpha but no RGB swap needed
-            if frame.shape[2] == 4:  # XBGR8888 has 4 channels
-                frame_bgr = frame[:, :, :3]  # Drop alpha, keep BGR
-            else:
-                frame_bgr = frame
-        else:
-            # RGB format - convert to BGR for OpenCV
-            if frame.shape[2] == 4:  # XRGB8888
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            else:  # RGB888
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        # Picamera2 with RGB888 format actually returns BGR order on Pi 5
+        # So we DON'T need to convert - just use the frame directly
+        # If colors look wrong, uncomment one of these conversions:
+        # frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # If too blue
+        # frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # If too red
+        frame_bgr = frame  # Try no conversion first
         
         # Crop to square if requested
         if self.crop_square > 0:
