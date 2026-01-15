@@ -159,10 +159,23 @@ IMX708_MODES = {
 class CameraCapture:
     """Handles camera capture on Raspberry Pi using picamera2."""
     
-    def __init__(self, resolution: tuple = (640, 480), fps: int = 30, full_fov: bool = True, crop_square: int = 0):
+    def __init__(self, resolution: tuple = (640, 480), fps: int = 30, 
+                 sensor_mode: str = "full", crop_square: int = 0):
+        """
+        Initialize camera capture.
+        
+        Args:
+            resolution: Output resolution (width, height)
+            fps: Frames per second
+            sensor_mode: Sensor mode to use - "full", "binned", or "auto"
+                - "full": 4608x2592 sensor readout (max quality, slower)
+                - "binned": 2304x1296 2x2 binned readout (good quality, faster)
+                - "auto": Let picamera2 choose based on output resolution
+            crop_square: If > 0, crop to this square size from center
+        """
         self.resolution = resolution
         self.fps = fps
-        self.full_fov = full_fov  # Use full field of view (wide angle)
+        self.sensor_mode = sensor_mode
         self.crop_square = crop_square  # If > 0, crop to this square size from center
         self.camera = None
         self._running = False
@@ -180,17 +193,33 @@ class CameraCapture:
             for i, mode in enumerate(sensor_modes):
                 logger.info(f"  Mode {i}: {mode}")
             
-            # Configure camera
-            # Use full sensor mode for maximum wide angle coverage
-            if self.full_fov:
-                # Use full sensor readout, then scale down to output resolution
-                # This preserves the full wide-angle field of view
+            # Configure camera based on sensor_mode setting
+            # IMX708 Wide sensor modes:
+            #   Mode 0: 1536x864 @ 120fps (cropped center)
+            #   Mode 1: 2304x1296 @ 56fps (2x2 binned, full FOV)
+            #   Mode 2: 4608x2592 @ 14fps (full resolution, full FOV)
+            
+            if self.sensor_mode == "full":
+                # Use full sensor readout - maximum detail
+                sensor_output = IMX708_MODES["full"]  # 4608x2592
+                logger.info(f"Using full sensor mode: {sensor_output}")
                 config = self.camera.create_preview_configuration(
                     main={"size": self.resolution, "format": "RGB888"},
-                    sensor={"output_size": IMX708_MODES["full"], "bit_depth": 10},
+                    sensor={"output_size": sensor_output, "bit_depth": 10},
+                    buffer_count=2
+                )
+            elif self.sensor_mode == "binned":
+                # Use 2x2 binned mode - good quality with better performance
+                sensor_output = IMX708_MODES["2x2_binned"]  # 2304x1296
+                logger.info(f"Using binned sensor mode: {sensor_output}")
+                config = self.camera.create_preview_configuration(
+                    main={"size": self.resolution, "format": "RGB888"},
+                    sensor={"output_size": sensor_output, "bit_depth": 10},
                     buffer_count=2
                 )
             else:
+                # Auto mode - let picamera2 choose
+                logger.info("Using auto sensor mode selection")
                 config = self.camera.create_preview_configuration(
                     main={"size": self.resolution, "format": "RGB888"}
                 )
@@ -207,7 +236,7 @@ class CameraCapture:
             main_format = camera_config.get('main', {}).get('format', 'unknown')
             logger.info(f"Sensor mode: {sensor_size}")
             logger.info(f"Main stream format: {main_format}")
-            logger.info(f"Camera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps (Full FOV: {self.full_fov})")
+            logger.info(f"Camera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps (Sensor: {self.sensor_mode})")
             
             # Store the format for color conversion decisions
             self._format = main_format
@@ -361,7 +390,7 @@ class ImageStreamer:
             self.camera = CameraCapture(
                 self.config.resolution, 
                 self.config.fps,
-                full_fov=getattr(self.config, 'full_fov', True),
+                sensor_mode=getattr(self.config, 'sensor_mode', 'full'),
                 crop_square=getattr(self.config, 'crop_square', 0)
             )
         
@@ -520,16 +549,20 @@ def main():
         description="Raspberry Pi Camera Image Streamer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Resolution Modes:
-    --full      4608x2592 @ 10fps  (9MP, maximum detail)
+Resolution Modes (IMX708 Wide sensor):
+    --full      4608x2592 @ 10fps  (full sensor, max detail, ~14fps max)
     --2500      2500x2500 @ 10fps  (square crop from full sensor)
-    --binned    2304x1296 @ 20fps  (2x2 binned, good balance)
-    --1080      1920x1080 @ 30fps  (default)
-    --720       1280x720  @ 30fps
-    --480       640x480   @ 30fps
+    --binned    2304x1296 @ 20fps  (2x2 binned sensor, good balance, ~56fps max)
+    --1080      1920x1080 @ 30fps  (binned sensor, scaled)
+    --720       1280x720  @ 30fps  (binned sensor, scaled)
+    --480       640x480   @ 30fps  (auto sensor mode)
+
+Sensor Modes:
+    Full (4608x2592):   Max quality, slower, higher power
+    Binned (2304x1296): 2x2 pixel binning, faster, lower power, good quality
 
 Examples:
-    # Default 1080p streaming
+    # Default 1080p streaming (uses binned sensor)
     python image_streamer.py --port 5000
     
     # Full resolution for maximum detail
@@ -545,7 +578,7 @@ Examples:
     python image_streamer.py --mock --720
 
 Note:
-    All modes use full sensor readout to preserve the wide-angle FOV.
+    Both full and binned modes preserve the full wide-angle FOV.
     For receiving images, use image_listener.py on the receiving machine.
         """
     )
@@ -582,27 +615,34 @@ Note:
     
     args = parser.parse_args()
     
-    # Determine resolution and fps from mode or explicit args
+    # Determine resolution, fps, and sensor mode from mode or explicit args
     crop_square = 0  # No square cropping by default
+    sensor_mode = "full"  # Default to full sensor readout
     
     if args.full:
         resolution = (4608, 2592)
+        sensor_mode = "full"
         default_fps = 10
     elif args.mode_2500:
         resolution = (4608, 2592)  # Capture at full, then crop
+        sensor_mode = "full"
         crop_square = 2500
         default_fps = 10
     elif args.binned:
         resolution = (2304, 1296)
+        sensor_mode = "binned"  # Use 2x2 binned sensor mode
         default_fps = 20
     elif args.mode_1080:
         resolution = (1920, 1080)
+        sensor_mode = "binned"  # Use binned mode, scaled down
         default_fps = 30
     elif args.mode_720:
         resolution = (1280, 720)
+        sensor_mode = "binned"  # Use binned mode, scaled down
         default_fps = 30
     elif args.mode_480:
         resolution = (640, 480)
+        sensor_mode = "auto"  # Let picamera2 choose
         default_fps = 30
     elif args.resolution:
         try:
@@ -611,10 +651,13 @@ Note:
         except ValueError:
             logger.error(f"Invalid resolution format: {args.resolution}")
             sys.exit(1)
+        # For custom resolutions, use binned mode if smaller than full
+        sensor_mode = "binned" if resolution[0] <= 2304 else "full"
         default_fps = 30
     else:
-        # Default to 1080p
+        # Default to 1080p with binned sensor
         resolution = (1920, 1080)
+        sensor_mode = "binned"
         default_fps = 30
     
     fps = args.fps if args.fps else default_fps
@@ -639,14 +682,13 @@ Note:
         fps=fps,
         quality=args.quality
     )
-    # Always use full FOV to preserve wide angle
-    config.full_fov = True
+    config.sensor_mode = sensor_mode
     config.crop_square = crop_square
     
     if crop_square > 0:
-        logger.info(f"Mode: {resolution[0]}x{resolution[1]} -> {crop_square}x{crop_square} (square crop) @ {fps}fps")
+        logger.info(f"Mode: {resolution[0]}x{resolution[1]} -> {crop_square}x{crop_square} (square crop) @ {fps}fps (sensor: {sensor_mode})")
     else:
-        logger.info(f"Mode: {resolution[0]}x{resolution[1]} @ {fps}fps")
+        logger.info(f"Mode: {resolution[0]}x{resolution[1]} @ {fps}fps (sensor: {sensor_mode})")
     
     streamer = ImageStreamer(config, device_id=args.device_id, mock=args.mock)
     streamer.start()
