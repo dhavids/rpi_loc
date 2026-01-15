@@ -133,7 +133,8 @@ def cmd_train(args):
         batch_size=args.batch_size,
         image_size=args.image_size,
         device=args.device,
-        name=args.name
+        name=args.name,
+        workers=args.workers
     )
     
     trainer = YOLOTrainer()
@@ -185,7 +186,8 @@ def cmd_finetune(args):
         base_model=args.base_model,
         epochs=args.epochs,
         freeze_layers=args.freeze_layers,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        workers=args.workers
     )
     
     print(f"\nFine-tuning complete!")
@@ -301,6 +303,7 @@ def main():
     p_train.add_argument("--device", default="auto", help="Device (auto, cpu, cuda, mps)")
     p_train.add_argument("--name", default="turtlebot", help="Run name")
     p_train.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
+    p_train.add_argument("--workers", type=int, default=8, help="Data loader workers (use 0 for Docker)")
     p_train.set_defaults(func=cmd_train)
     
     # Fine-tune command
@@ -310,6 +313,7 @@ def main():
     p_finetune.add_argument("--epochs", type=int, default=50)
     p_finetune.add_argument("--batch-size", type=int, default=16)
     p_finetune.add_argument("--freeze-layers", type=int, default=0, help="Layers to freeze")
+    p_finetune.add_argument("--workers", type=int, default=0, help="Data loader workers (0 for Docker)")
     p_finetune.set_defaults(func=cmd_finetune)
     
     # Evaluate command
