@@ -487,17 +487,21 @@ class ImageStreamer:
             
             self._frame_count += 1
             
-            # Log frame number periodically (every 30 frames)
-            if self._frame_count % 30 == 0:
-                with self.clients_lock:
-                    num_clients = len(self.clients)
-                logger.info(f"Frame {self._frame_count} sent | Clients: {num_clients} | FPS: {1.0/max(0.001, elapsed):.1f}")
-            
             # Maintain frame rate
             elapsed = time.time() - start_time
             sleep_time = frame_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+            
+            # Calculate actual FPS after rate limiting
+            total_frame_time = time.time() - start_time
+            actual_fps = 1.0 / max(0.001, total_frame_time)
+            
+            # Log frame number periodically (every 30 frames)
+            if self._frame_count % 30 == 0:
+                with self.clients_lock:
+                    num_clients = len(self.clients)
+                logger.info(f"Frame {self._frame_count} sent | Clients: {num_clients} | FPS: {actual_fps:.1f}")
     
     def _broadcast_frame(self, image_data: bytes, metadata: dict):
         """Broadcast frame to all connected clients."""

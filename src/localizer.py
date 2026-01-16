@@ -330,12 +330,15 @@ class TurtleBotLocalizer:
                 broadcaster=self._broadcaster
             )
         
-        # Image listener
+        # Image listener - use max_lag_ms=0 to disable frame dropping
+        # The localizer processes all frames for tracking consistency
+        # Frame dropping happens at display/broadcast level if needed
         self.listener = ImageListener(
             host=config.host,
             port=config.port,
             display=False,  # We handle display ourselves
-            on_frame=self._on_frame
+            on_frame=self._on_frame,
+            max_lag_ms=0  # Disable frame dropping - process all frames
         )
         
         # State

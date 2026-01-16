@@ -59,7 +59,8 @@ class ImageListener:
         window_name: str = None,
         max_display_width: int = 1280,
         max_display_height: int = 720,
-        show_overlay: bool = False
+        show_overlay: bool = False,
+        max_lag_ms: float = 200.0
     ):
         """
         Initialize the ImageListener.
@@ -74,6 +75,7 @@ class ImageListener:
             max_display_width: Maximum display window width (scales down if larger)
             max_display_height: Maximum display window height (scales down if larger)
             show_overlay: Whether to show text overlay on display
+            max_lag_ms: Maximum acceptable lag in ms - frames older than this are dropped
         """
         self.host = host
         self.port = port
@@ -84,10 +86,12 @@ class ImageListener:
         self.max_display_width = max_display_width
         self.max_display_height = max_display_height
         self.show_overlay = show_overlay
+        self.max_lag_ms = max_lag_ms
         
         self._socket: Optional[socket.socket] = None
         self._running = False
         self._frame_count = 0
+        self._frames_dropped = 0
         self._connected = False
         
         # Statistics
@@ -111,10 +115,19 @@ class ImageListener:
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.settimeout(10.0)
         
+        # Reduce receive buffer to minimize latency (default is often 128KB+)
+        # Smaller buffer = less queued data = lower latency
+        try:
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # 64KB
+        except Exception:
+            pass
+        
         try:
             logger.info(f"Connecting to {self.host}:{self.port}...")
             self._socket.connect((self.host, self.port))
             self._socket.settimeout(None)  # Remove timeout for streaming
+            # Disable Nagle's algorithm for lower latency
+            self._socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._connected = True
             logger.info("Connected successfully!")
             return True
@@ -207,6 +220,15 @@ class ImageListener:
             if server_timestamp_ms > 0:
                 self._lag_ms = (current_time * 1000) - server_timestamp_ms
             
+            # Drop frames that are too old (lag > threshold)
+            if self.max_lag_ms > 0 and self._lag_ms > self.max_lag_ms:
+                self._frames_dropped += 1
+                # Log occasionally when dropping
+                if self._frames_dropped % 30 == 1:
+                    logger.warning(f"Dropping frames (lag={self._lag_ms:.0f}ms > {self.max_lag_ms:.0f}ms) - "
+                                   f"dropped {self._frames_dropped} total")
+                continue
+            
             # Decode image
             nparr = np.frombuffer(image_data, np.uint8)
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -217,10 +239,11 @@ class ImageListener:
             
             # Log frame info
             if self._frame_count % 30 == 0:  # Log every 30 frames
+                drop_info = f" | Dropped: {self._frames_dropped}" if self._frames_dropped > 0 else ""
                 logger.info(
                     f"Frame {server_frame} (recv: {self._frame_count}) | "
                     f"Device: {metadata.get('device_id', '?')} | "
-                    f"FPS: {self._fps:.1f} | Lag: {self._lag_ms:.0f}ms"
+                    f"FPS: {self._fps:.1f} | Lag: {self._lag_ms:.0f}ms{drop_info}"
                 )
             
             # Call custom callback if provided
@@ -439,6 +462,8 @@ Controls (when display is enabled):
                        help="Maximum display height - scales down if larger (default: 720)")
     parser.add_argument("--show-overlay", action="store_true",
                        help="Show text overlay on display")
+    parser.add_argument("--max-lag", type=float, default=200.0,
+                       help="Max lag in ms before dropping frames (0 to disable, default: 200)")
     
     args = parser.parse_args()
     
@@ -466,7 +491,8 @@ Controls (when display is enabled):
         window_name=args.window_name,
         max_display_width=args.max_width,
         max_display_height=args.max_height,
-        show_overlay=args.show_overlay
+        show_overlay=args.show_overlay,
+        max_lag_ms=args.max_lag
     )
     
     listener.start(
