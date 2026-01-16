@@ -163,6 +163,8 @@ class TCPServer:
 class TCPClient:
     """
     Reusable TCP client for connecting to servers.
+    
+    Supports both raw byte communication and line-based JSON streaming.
     """
     
     def __init__(
@@ -170,16 +172,19 @@ class TCPClient:
         host: str,
         port: int,
         timeout: float = 10.0,
+        read_timeout: float = 5.0,
         reconnect: bool = True,
         reconnect_delay: float = 5.0
     ):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.read_timeout = read_timeout  # Timeout for read operations
         self.reconnect = reconnect
         self.reconnect_delay = reconnect_delay
         
         self._socket: Optional[socket.socket] = None
+        self._file: Optional[Any] = None  # File-like interface for readline
         self._connected = False
         self._lock = threading.Lock()
     
@@ -189,6 +194,9 @@ class TCPClient:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._socket.settimeout(self.timeout)
             self._socket.connect((self.host, self.port))
+            # Keep a read timeout to prevent blocking indefinitely
+            self._socket.settimeout(self.read_timeout)
+            self._file = self._socket.makefile("r")
             self._connected = True
             logger.info(f"Connected to {self.host}:{self.port}")
             return True
@@ -201,6 +209,12 @@ class TCPClient:
     def disconnect(self):
         """Disconnect from the server."""
         self._connected = False
+        if self._file:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
         if self._socket:
             try:
                 self._socket.close()
@@ -223,7 +237,7 @@ class TCPClient:
             return False
     
     def receive(self, size: int) -> Optional[bytes]:
-        """Receive data from the server."""
+        """Receive exactly `size` bytes from the server."""
         if not self._connected:
             return None
         
@@ -237,6 +251,33 @@ class TCPClient:
             return data
         except Exception as e:
             logger.error(f"Receive failed: {e}")
+            self._connected = False
+            return None
+    
+    def readline(self) -> Optional[str]:
+        """
+        Read a line from the server (for line-based protocols like JSON streams).
+        
+        Returns:
+            The line as a string (including newline), or None if disconnected or timeout.
+            Empty string means connection was closed by server.
+        """
+        if not self._connected or not self._file:
+            return None
+        
+        try:
+            line = self._file.readline()
+            if not line:
+                # Connection closed
+                self._connected = False
+                return ""
+            return line
+        except socket.timeout:
+            # Read timeout - connection might still be valid, return None to trigger retry
+            logger.warning(f"Read timeout on {self.host}:{self.port}")
+            return None
+        except Exception as e:
+            logger.error(f"Readline failed: {e}")
             self._connected = False
             return None
     

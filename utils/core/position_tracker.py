@@ -74,14 +74,20 @@ class PositionTracker:
     - Position smoothing using EMA
     - Association between frames using distance-based matching
     - Timeout handling for lost objects
+    - Re-identification of recently lost objects
     """
     
     # Configuration
     MAX_ASSOCIATION_DISTANCE = 0.5  # meters (or pixels if no homography)
     MAX_PIXEL_DISTANCE = 100  # pixels for association
-    EMA_ALPHA = 0.3  # Smoothing factor (higher = more responsive)
+    EMA_ALPHA = 0.5  # Smoothing factor (higher = more responsive)
     LOST_TIMEOUT = 2.0  # seconds before object is considered lost
     MIN_CONFIDENCE = 0.3  # Minimum confidence to track
+    
+    # Re-identification configuration
+    REIDENTIFY_TIMEOUT = 30.0  # seconds to keep lost objects for re-identification
+    REIDENTIFY_DISTANCE = 1.0  # meters - max distance to re-identify
+    REIDENTIFY_PIXEL_DISTANCE = 200  # pixels - max distance to re-identify
     
     def __init__(
         self,
@@ -102,6 +108,7 @@ class PositionTracker:
         self.use_pixel_association = use_pixel_association
         
         self._objects: Dict[int, TrackedObject] = {}
+        self._lost_objects: Dict[int, TrackedObject] = {}  # Recently lost, for re-identification
         self._next_id = 0  # 0-indexed: M0, M1, M2, ...
         self._frame_count = 0
     
@@ -158,7 +165,7 @@ class PositionTracker:
         
         for detection in unmatched_detections:
             if len(self._objects) < self.max_objects:
-                self._create_object(detection, timestamp)
+                self._create_object(detection, timestamp, homography_valid)
         
         # Update miss counts and remove lost objects
         self._update_lost_objects(timestamp, matched_ids)
@@ -283,19 +290,45 @@ class PositionTracker:
         obj.detection_count += 1
         obj.consecutive_misses = 0
     
-    def _create_object(self, detection: Dict, timestamp: float):
-        """Create a new tracked object."""
-        obj_id = self._next_id
-        self._next_id += 1
+    def _create_object(self, detection: Dict, timestamp: float, homography_valid: bool = False):
+        """
+        Create a new tracked object, or re-identify a recently lost one.
         
-        name = detection.get("name", f"turtlebot_{obj_id}")
+        First checks if the detection is near a recently lost object's last position.
+        If so, re-uses that object's ID for continuity.
+        """
+        # Check if this detection matches a recently lost object
+        reidentified_obj = self._try_reidentify(detection, timestamp, homography_valid)
         
-        obj = TrackedObject(
-            local_id=obj_id,
-            name=name
-        )
+        if reidentified_obj is not None:
+            obj_id = reidentified_obj.local_id
+            obj = reidentified_obj
+            
+            # Remove from lost objects
+            del self._lost_objects[obj_id]
+            
+            # Reset consecutive misses
+            obj.consecutive_misses = 0
+            
+            logger.info(
+                f"Re-identified TurtleBot {obj.name} (ID {obj_id}) - "
+                f"was lost for {timestamp - obj.last_seen:.1f}s"
+            )
+        else:
+            # Create brand new object
+            obj_id = self._next_id
+            self._next_id += 1
+            
+            name = detection.get("name", f"turtlebot_{obj_id}")
+            
+            obj = TrackedObject(
+                local_id=obj_id,
+                name=name
+            )
+            
+            logger.info(f"New TurtleBot tracked: {name} (ID {obj_id})")
         
-        # Initialize with first detection
+        # Initialize/update with detection
         x = detection.get("x", 0.0)
         y = detection.get("y", 0.0)
         theta = detection.get("theta", 0.0)
@@ -317,14 +350,65 @@ class PositionTracker:
         
         obj.history.append(pos)
         obj.last_seen = timestamp
-        obj.detection_count = 1
+        obj.detection_count += 1
         
         self._objects[obj_id] = obj
-        
-        logger.info(f"New TurtleBot tracked: {name} (ID {obj_id})")
     
+    def _try_reidentify(
+        self, 
+        detection: Dict, 
+        timestamp: float,
+        homography_valid: bool
+    ) -> Optional[TrackedObject]:
+        """
+        Try to re-identify a recently lost object based on position proximity.
+        
+        Returns the matched TrackedObject if found, None otherwise.
+        """
+        if not self._lost_objects:
+            return None
+        
+        best_match = None
+        best_distance = float('inf')
+        
+        det_x = detection.get("x", 0.0)
+        det_y = detection.get("y", 0.0)
+        det_px = detection.get("pixel_x", 0)
+        det_py = detection.get("pixel_y", 0)
+        
+        for obj_id, obj in self._lost_objects.items():
+            # Check if still within re-identification window
+            time_since_lost = timestamp - obj.last_seen
+            if time_since_lost > self.REIDENTIFY_TIMEOUT:
+                continue
+            
+            # Get last known position
+            last_pos = obj.current_position
+            if last_pos is None:
+                continue
+            
+            # Calculate distance
+            if homography_valid and not self.use_pixel_association:
+                # World coordinate distance
+                dx = det_x - last_pos.x
+                dy = det_y - last_pos.y
+                dist = math.sqrt(dx * dx + dy * dy)
+                max_dist = self.REIDENTIFY_DISTANCE
+            else:
+                # Pixel distance
+                dx = det_px - last_pos.pixel_x
+                dy = det_py - last_pos.pixel_y
+                dist = math.sqrt(dx * dx + dy * dy)
+                max_dist = self.REIDENTIFY_PIXEL_DISTANCE
+            
+            if dist < max_dist and dist < best_distance:
+                best_distance = dist
+                best_match = obj
+        
+        return best_match
+
     def _update_lost_objects(self, timestamp: float, matched_ids: set):
-        """Update miss counts and remove lost objects."""
+        """Update miss counts and handle lost objects."""
         lost_ids = []
         
         for obj_id, obj in self._objects.items():
@@ -340,9 +424,24 @@ class PositionTracker:
                         f"not seen for {time_since_seen:.1f}s"
                     )
         
-        # Remove lost objects
+        # Move lost objects to cache for potential re-identification
         for obj_id in lost_ids:
+            self._lost_objects[obj_id] = self._objects[obj_id]
             del self._objects[obj_id]
+        
+        # Clean up expired objects from lost cache
+        expired_ids = []
+        for obj_id, obj in self._lost_objects.items():
+            time_since_lost = timestamp - obj.last_seen
+            if time_since_lost > self.REIDENTIFY_TIMEOUT:
+                expired_ids.append(obj_id)
+        
+        for obj_id in expired_ids:
+            logger.debug(
+                f"Removing expired lost object {self._lost_objects[obj_id].name} "
+                f"(ID {obj_id}) from re-identification cache"
+            )
+            del self._lost_objects[obj_id]
     
     def get_tracked_objects(self) -> List[TrackedObject]:
         """Get all currently tracked objects."""
@@ -355,7 +454,8 @@ class PositionTracker:
     def reset(self):
         """Reset all tracking state."""
         self._objects.clear()
-        self._next_id = 1
+        self._lost_objects.clear()
+        self._next_id = 0
         self._frame_count = 0
         logger.info("Tracker reset")
     
@@ -370,6 +470,7 @@ class PositionTracker:
         return {
             "frame_count": self._frame_count,
             "tracked_objects": len(self._objects),
+            "lost_objects_in_cache": len(self._lost_objects),
             "next_id": self._next_id,
             "objects": {
                 obj.local_id: {

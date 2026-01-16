@@ -94,6 +94,8 @@ class ImageListener:
         self._bytes_received = 0
         self._last_frame_time = 0
         self._fps = 0.0
+        self._last_server_frame = 0  # Last frame number from server
+        self._lag_ms = 0.0  # Estimated lag in milliseconds
         
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
@@ -191,12 +193,19 @@ class ImageListener:
             
             self._bytes_received += len(image_data)
             
-            # Calculate FPS
+            # Calculate FPS and lag
             current_time = time.time()
             if self._last_frame_time > 0:
                 dt = current_time - self._last_frame_time
                 self._fps = 0.9 * self._fps + 0.1 * (1.0 / dt) if dt > 0 else self._fps
             self._last_frame_time = current_time
+            
+            # Track server frame number and estimate lag from timestamp
+            server_frame = metadata.get('frame_number', 0)
+            self._last_server_frame = server_frame
+            server_timestamp_ms = metadata.get('timestamp_ms', 0)
+            if server_timestamp_ms > 0:
+                self._lag_ms = (current_time * 1000) - server_timestamp_ms
             
             # Decode image
             nparr = np.frombuffer(image_data, np.uint8)
@@ -209,9 +218,9 @@ class ImageListener:
             # Log frame info
             if self._frame_count % 30 == 0:  # Log every 30 frames
                 logger.info(
-                    f"Frame {metadata.get('frame_number', '?')} | "
+                    f"Frame {server_frame} (recv: {self._frame_count}) | "
                     f"Device: {metadata.get('device_id', '?')} | "
-                    f"FPS: {self._fps:.1f}"
+                    f"FPS: {self._fps:.1f} | Lag: {self._lag_ms:.0f}ms"
                 )
             
             # Call custom callback if provided
@@ -284,11 +293,22 @@ class ImageListener:
         # First scale to fit display
         display_frame = self._scale_to_fit(frame)
         
-        # Return early if overlay is disabled
+        h, w = display_frame.shape[:2]
+        
+        # Always show frame number and lag in top-right corner (minimal overlay)
+        server_frame = metadata.get('frame_number', '?')
+        lag_color = (0, 255, 0) if self._lag_ms < 100 else (0, 165, 255) if self._lag_ms < 200 else (0, 0, 255)
+        frame_text = f"F:{server_frame} Lag:{self._lag_ms:.0f}ms"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(frame_text, font, font_scale, thickness)
+        cv2.rectangle(display_frame, (w - text_w - 15, 5), (w - 5, text_h + 15), (0, 0, 0), -1)
+        cv2.putText(display_frame, frame_text, (w - text_w - 10, text_h + 10), font, font_scale, lag_color, thickness)
+        
+        # Return early if full overlay is disabled
         if not self.show_overlay:
             return display_frame
-        
-        h, w = display_frame.shape[:2]
         
         # Scale overlay elements based on frame size
         scale_factor = min(w / 640, h / 480)  # Reference size for scaling UI

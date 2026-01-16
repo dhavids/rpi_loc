@@ -34,12 +34,55 @@ logger = logging.getLogger(__name__)
 # Default paths relative to this file's location
 # Structure: rpi_loc/src/models/yolo/cli.py -> rpi_loc/files/models/yolo/
 _THIS_DIR = Path(__file__).parent
-_FILES_DIR = _THIS_DIR.parent.parent.parent / "files" / "models" / "yolo"
+_RPI_LOC_DIR = _THIS_DIR.parent.parent.parent
+_FILES_DIR = _RPI_LOC_DIR / "files" / "models" / "yolo"
 DEFAULT_DATA_DIR = _FILES_DIR / "data"
 DEFAULT_RUNS_DIR = _FILES_DIR / "runs"
 DEFAULT_IMAGES_DIR = DEFAULT_DATA_DIR / "images"
 DEFAULT_LABELS_DIR = DEFAULT_DATA_DIR / "labels"
 DEFAULT_DATASET_DIR = DEFAULT_DATA_DIR / "dataset"
+
+
+def _resolve_path(user_path: str) -> str:
+    """
+    Resolve a user-provided path, checking files directory if not found in pwd.
+    
+    For a path like 'data/images_4':
+    1. If it exists relative to pwd, use it
+    2. If parent (data) exists relative to pwd, use pwd path
+    3. If parent (data) exists in files directory, use files/data/images_4
+    4. Otherwise, default to pwd path
+    
+    Returns the resolved absolute path as a string.
+    """
+    path = Path(user_path)
+    
+    # If absolute path, use as-is
+    if path.is_absolute():
+        return str(path)
+    
+    cwd = Path.cwd()
+    cwd_path = cwd / path
+    
+    # If the path or its parent exists in pwd, use pwd
+    if cwd_path.exists() or cwd_path.parent.exists():
+        return str(cwd_path)
+    
+    # Check if the first component (e.g., 'data') exists in files directory
+    parts = path.parts
+    if parts:
+        first_part = parts[0]
+        files_base = _RPI_LOC_DIR / "files"
+        
+        # Check if first_part exists in files directory
+        if (files_base / first_part).exists():
+            # Use files directory path
+            resolved = files_base / path
+            logger.info(f"Resolved '{user_path}' to files directory: {resolved}")
+            return str(resolved)
+    
+    # Default: use cwd path
+    return str(cwd_path)
 
 
 def _get_default_path(path_type: str) -> str:
@@ -368,21 +411,35 @@ def main():
         parser.print_help()
         sys.exit(1)
     
-    # Apply defaults for paths if not provided
-    if hasattr(args, 'output') and args.output is None:
+    # Resolve user-provided paths (check files directory if not found in pwd)
+    if hasattr(args, 'output') and args.output is not None:
+        args.output = _resolve_path(args.output)
+    elif hasattr(args, 'output') and args.output is None:
         if args.command == "collect":
             args.output = _get_default_path("images")
         elif args.command == "create-dataset":
             args.output = _get_default_path("dataset")
     
-    if hasattr(args, 'images') and args.images is None:
+    if hasattr(args, 'images') and args.images is not None:
+        args.images = _resolve_path(args.images)
+    elif hasattr(args, 'images') and args.images is None:
         args.images = _get_default_path("images")
     
-    if hasattr(args, 'labels') and args.labels is None:
+    if hasattr(args, 'labels') and args.labels is not None:
+        args.labels = _resolve_path(args.labels)
+    elif hasattr(args, 'labels') and args.labels is None:
         args.labels = _get_default_path("labels")
     
-    if hasattr(args, 'data') and args.data is None:
+    if hasattr(args, 'data') and args.data is not None:
+        args.data = _resolve_path(args.data)
+    elif hasattr(args, 'data') and args.data is None:
         args.data = _get_default_path("dataset")
+    
+    if hasattr(args, 'source') and args.source is not None:
+        args.source = _resolve_path(args.source)
+    
+    if hasattr(args, 'model') and args.model is not None:
+        args.model = _resolve_path(args.model)
     
     args.func(args)
 

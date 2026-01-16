@@ -278,7 +278,7 @@ if [ "$IS_RPI" = false ]; then
         cur="${COMP_WORDS[COMP_CWORD]}"
         prev="${COMP_WORDS[COMP_CWORD-1]}"
         
-        opts="--host --port --config --model --confidence --broadcast --broadcast-port --csv --no-display --no-reconnect --timeout --help"
+        opts="--host --port --config --model --confidence --broadcast --broadcast-port --csv --no-display --plot --no-reconnect --overlay --timeout --log-level --capture-images --capture-interval --capture-dir --help -m -c -b -p -o -t"
         
         case "${prev}" in
             --host)
@@ -289,11 +289,15 @@ if [ "$IS_RPI" = false ]; then
                 COMPREPLY=( $(compgen -W "5000 5555 5001" -- ${cur}) )
                 return 0
                 ;;
-            --config|--model|-m|--csv)
+            --config|--model|-m|--csv|--capture-dir)
                 COMPREPLY=( $(compgen -f -- ${cur}) )
                 return 0
                 ;;
-            --confidence|--timeout)
+            --confidence|-c|--timeout|--capture-interval)
+                return 0
+                ;;
+            --log-level)
+                COMPREPLY=( $(compgen -W "debug info warning error" -- ${cur}) )
                 return 0
                 ;;
         esac

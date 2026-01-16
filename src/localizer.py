@@ -59,6 +59,7 @@ _THIS_DIR = Path(__file__).parent
 _RPI_LOC_ROOT = _THIS_DIR.parent
 _DEFAULT_MODEL_PATH = _RPI_LOC_ROOT / "files" / "models" / "yolo" / "runs" / "detect" / "runs" / "train" / "turtlebot" / "weights" / "best.pt"
 _DEFAULT_CSV_DIR = _RPI_LOC_ROOT / "files" / "logs"
+_DEFAULT_CAPTURE_DIR = _RPI_LOC_ROOT / "files" / "localizer"
 
 
 class ReferenceMarkerError(Exception):
@@ -106,16 +107,22 @@ class LocalizerConfig:
     
     # Display
     display: bool = True
+    overlay_detections: bool = False  # Show YOLO bounding boxes on display
+    
+    # Capture
+    capture_images: bool = False  # Periodically save raw frames
+    capture_interval: float = 5.0  # Seconds between captures
+    capture_dir: Optional[str] = None  # Directory to save captures
     
     def __post_init__(self):
         # Default reference markers (4m x 4m area) with TR as (0,0) and BL as (4,4)
         # R-index order: R0=(0,0), R1=(0,3.5), R2=(0,4), R3=(4,3.5)
         if self.reference_markers is None:
             self.reference_markers = [
-                MarkerConfig(marker_id=2, world_x=0.0, world_y=0.0, r_index=0),  # R0 - TR
-                MarkerConfig(marker_id=3, world_x=4.0, world_y=0.0, r_index=1),  # R1 - TL (moved)
-                MarkerConfig(marker_id=0, world_x=0.0, world_y=3.5, r_index=2),  # R2 - BR
-                MarkerConfig(marker_id=1, world_x=4.0, world_y=3.5, r_index=3),  # R3 - BL
+                MarkerConfig(marker_id=1, world_x=0.0, world_y=0.0, r_index=0),  # R0 - TR
+                MarkerConfig(marker_id=0, world_x=4.0, world_y=0.0, r_index=1),  # R1 - TL (moved)
+                MarkerConfig(marker_id=3, world_x=0.0, world_y=3.5, r_index=2),  # R2 - BR
+                MarkerConfig(marker_id=2, world_x=4.0, world_y=3.5, r_index=3),  # R3 - BL
             ]
 
 
@@ -260,6 +267,7 @@ class TurtleBotLocalizer:
             config: Localizer configuration
             csv_path: Path to save CSV positions (None to disable)
             broadcast: Whether to broadcast positions
+            plot: Whether to enable position plotter
             on_pose_update: Callback for pose updates
         """
         self.config = config
@@ -335,6 +343,18 @@ class TurtleBotLocalizer:
         self._last_frame_time = 0.0
         self._frame_count = 0
         self._paused = False
+        self._last_yolo_detections: List[Dict] = []  # Store for overlay drawing (only valid detections)
+        
+        # Capture state
+        self._capture_enabled = config.capture_images
+        self._capture_interval = config.capture_interval
+        self._capture_dir = Path(config.capture_dir) if config.capture_dir else _DEFAULT_CAPTURE_DIR
+        self._last_capture_time = 0.0
+        self._capture_count = 0
+        
+        if self._capture_enabled:
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Image capture enabled: saving to {self._capture_dir} every {self._capture_interval}s")
         
         # Display
         self._window_name = "TurtleBot Localizer"
@@ -362,11 +382,11 @@ class TurtleBotLocalizer:
             if self._sink:
                 self._sink.resume()
         
-        # Step 1: Detect ArUco reference markers
+        # Detect ArUco reference markers
         markers = self.aruco_detector.detect(frame)
         ref_markers_found = [mid for mid in markers if mid in self.reference_markers]
         
-        # Step 2: Update homography if enough markers
+        # Update homography if enough markers
         if len(ref_markers_found) >= self.config.min_reference_markers:
             self._update_homography(markers)
             
@@ -397,30 +417,57 @@ class TurtleBotLocalizer:
                 self._draw_calibration_frame(frame, markers, ref_markers_found)
             return
         
-        # Step 3: Detect TurtleBots with YOLO
+        # Detect TurtleBots with YOLO
         turtlebot_detections = []
         if self._yolo_detector:
             yolo_detections = self._yolo_detector.detect(frame)
             
-            # Transform to world coordinates
+            # Get reference marker pixel positions for filtering
+            ref_marker_pixels = []
+            for marker_id in markers:
+                if marker_id in self.reference_markers:
+                    px, py = self.aruco_detector.get_center(markers[marker_id])
+                    ref_marker_pixels.append((int(px), int(py)))
+            
+            # Transform to world coordinates and filter out detections near reference markers
             for det in yolo_detections:
-                world_x, world_y = self._transform_to_world(
-                    det["pixel_x"], det["pixel_y"]
-                )
+                pixel_x, pixel_y = det["pixel_x"], det["pixel_y"]
+                
+                # Use 50 pixels as threshold - roughly the size of an ArUco marker
+                REF_MARKER_EXCLUSION_RADIUS = 60  # pixels
+                near_ref_marker = False
+                for ref_px, ref_py in ref_marker_pixels:
+                    dist = np.sqrt((pixel_x - ref_px)**2 + (pixel_y - ref_py)**2)
+                    if dist < REF_MARKER_EXCLUSION_RADIUS:
+                        near_ref_marker = True
+                        logger.debug(
+                            f"Ignoring YOLO detection at ({pixel_x}, {pixel_y}) - "
+                            f"too close to reference marker at ({ref_px}, {ref_py}), "
+                            f"dist={dist:.1f}px"
+                        )
+                        break
+                
+                if near_ref_marker:
+                    continue
+                
+                world_x, world_y = self._transform_to_world(pixel_x, pixel_y)
                 det["x"] = world_x
                 det["y"] = world_y
                 det["theta"] = 0.0  # YOLO doesn't give orientation
                 det["name"] = f"turtlebot"
                 turtlebot_detections.append(det)
+            
+            # Store only valid detections for overlay drawing (excluding ignored ones)
+            self._last_yolo_detections = turtlebot_detections
         
-        # Step 4: Update tracker
+        # Update tracker
         tracked = self.tracker.update(
             turtlebot_detections,
             timestamp,
             homography_valid=self._homography_valid
         )
         
-        # Step 5: Publish positions
+        # Publish positions
         if self._sink:
             # Build TurtleBot positions with M{id} naming
             positions = [
@@ -439,7 +486,6 @@ class TurtleBotLocalizer:
             ]
             
             # Build reference marker positions
-            # R0=(0,0), R1=(4,0), R2=(0,4), R3=(4,4)
             ref_marker_positions = []
             for marker_id, marker_cfg in self.reference_markers.items():
                 detected = marker_id in markers
@@ -466,7 +512,7 @@ class TurtleBotLocalizer:
                 self._homography_valid
             )
         
-        # Step 6: Update plotter
+        # Update plotter with BOT and REF positions
         if self._plotter and self._homography_valid:
             for obj in tracked:
                 x, y, _ = obj.smoothed_position
@@ -477,7 +523,6 @@ class TurtleBotLocalizer:
                     y=y,
                     z=0.0
                 )
-            # Also plot reference markers
             for marker_id, marker_cfg in self.reference_markers.items():
                 if marker_id in markers:
                     self._plotter.update(
@@ -488,13 +533,39 @@ class TurtleBotLocalizer:
                         z=0.0
                     )
         
-        # Step 7: Call user callback
+        # Call user callback
         if self.on_pose_update and tracked:
             self.on_pose_update(tracked)
         
-        # Step 8: Display
+        # Capture raw frame if enabled
+        if self._capture_enabled and self._calibrated:
+            self._maybe_capture_frame(frame, timestamp)
+        
+        # Display
         if self.config.display:
             self._draw_frame(frame, markers, ref_markers_found, tracked)
+    
+    def _maybe_capture_frame(self, frame: np.ndarray, timestamp: float):
+        """
+        Capture and save raw frame if enough time has passed.
+        
+        Args:
+            frame: Raw unmodified frame
+            timestamp: Current timestamp
+        """
+        current_time = time.time()
+        
+        if current_time - self._last_capture_time >= self._capture_interval:
+            self._last_capture_time = current_time
+            self._capture_count += 1
+            
+            # Generate filename with timestamp
+            filename = f"capture_{self._capture_count:05d}_{int(timestamp*1000)}.jpg"
+            filepath = self._capture_dir / filename
+            
+            # Save raw frame (no overlays)
+            cv2.imwrite(str(filepath), frame)
+            logger.debug(f"Captured frame: {filepath}")
     
     def _load_yolo_model(self):
         """Load the YOLO model."""
@@ -651,6 +722,20 @@ class TurtleBotLocalizer:
             corners = list(markers.values())
             ids = np.array([[mid] for mid in markers.keys()])
             cv2.aruco.drawDetectedMarkers(output, corners, ids)
+        
+        # Draw YOLO detection bounding boxes if overlay enabled
+        if self.config.overlay_detections and self._last_yolo_detections:
+            for det in self._last_yolo_detections:
+                bbox = det.get("bbox")
+                if bbox:
+                    x, y, w, h = bbox
+                    conf = det.get("confidence", 0)
+                    # Draw bounding box in cyan
+                    cv2.rectangle(output, (x, y), (x + w, y + h), (255, 255, 0), 2)
+                    # Draw confidence label
+                    conf_label = f"{conf:.0%}"
+                    cv2.putText(output, conf_label, (x, y - 5),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
         # Colors for different TurtleBots
         colors = [
@@ -870,7 +955,7 @@ Controls (when display is enabled):
                        help="Path to JSON configuration file")
     parser.add_argument("--model", "-m", type=str,
                        help="Path to YOLO model (default: files/models/yolo/.../best.pt)")
-    parser.add_argument("--confidence", type=float, default=0.85,
+    parser.add_argument("--confidence", "-c", type=float, default=0.85,
                        help="Detection confidence threshold (default: 0.5)")
     parser.add_argument("--broadcast", "-b", action="store_true",
                        help="Enable position broadcasting")
@@ -884,11 +969,19 @@ Controls (when display is enabled):
                        help="Enable position plotter (matplotlib)")
     parser.add_argument("--no-reconnect", action="store_true",
                        help="Disable auto-reconnect")
+    parser.add_argument("--overlay", "-o", action="store_true",
+                       help="Overlay YOLO detection bounding boxes on display")
     parser.add_argument("--timeout", type=float, default=3.0,
                        help="Stream timeout in seconds (default: 3.0)")
     parser.add_argument("--log-level", default="info",
                        choices=["debug", "info", "warning", "error"],
                        help="Logging level (default: info)")
+    parser.add_argument("--capture-images", "-t", action="store_true",
+                       help="Enable periodic capture of raw frames")
+    parser.add_argument("--capture-interval", type=float, default=5.0,
+                       help="Interval between captures in seconds (default: 5.0)")
+    parser.add_argument("--capture-dir", type=str,
+                       help=f"Directory to save captured images (default: {_DEFAULT_CAPTURE_DIR})")
     
     args = parser.parse_args()
     
@@ -920,7 +1013,11 @@ Controls (when display is enabled):
             confidence_threshold=args.confidence,
             broadcast_port=args.broadcast_port,
             stream_timeout=args.timeout,
-            display=not args.no_display
+            display=not args.no_display,
+            overlay_detections=args.overlay,
+            capture_images=args.capture_images,
+            capture_interval=args.capture_interval,
+            capture_dir=args.capture_dir
         )
     
     # Create and start localizer

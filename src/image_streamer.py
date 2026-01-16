@@ -487,6 +487,12 @@ class ImageStreamer:
             
             self._frame_count += 1
             
+            # Log frame number periodically (every 30 frames)
+            if self._frame_count % 30 == 0:
+                with self.clients_lock:
+                    num_clients = len(self.clients)
+                logger.info(f"Frame {self._frame_count} sent | Clients: {num_clients} | FPS: {1.0/max(0.001, elapsed):.1f}")
+            
             # Maintain frame rate
             elapsed = time.time() - start_time
             sleep_time = frame_interval - elapsed
