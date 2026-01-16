@@ -191,11 +191,12 @@ class YOLOTrainer:
         # Train
         self.results = self.model.train(**train_params)
         
-        # Get best model path
-        best_path = Path(config.project) / config.name / "weights" / "best.pt"
-        if best_path.exists():
-            self.model_path = str(best_path)
-            logger.info(f"Best model saved to: {best_path}")
+        # Get best model path from results
+        if self.results and hasattr(self.results, 'save_dir'):
+            best_path = Path(self.results.save_dir) / "weights" / "best.pt"
+            if best_path.exists():
+                self.model_path = str(best_path)
+                logger.info(f"Best model saved to: {best_path}")
         
         return self._parse_results()
     

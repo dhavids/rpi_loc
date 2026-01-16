@@ -2,19 +2,24 @@
 """
 TurtleBot Localizer
 
-Combines image streaming and ArUco-based localization to track TurtleBots
-in real-time from a Raspberry Pi camera stream.
+Real-time TurtleBot localization using:
+- Image streaming from Raspberry Pi camera
+- ArUco reference markers for world coordinate calibration
+- YOLO object detection for TurtleBot tracking
+- Homography-based transformation to world coordinates
+- Position broadcasting and CSV logging
 
 Usage:
     python localizer.py --host 100.99.98.1 --port 5000
-    python localizer.py --config markers.yaml
+    python localizer.py --config config.json --broadcast --csv positions.csv
 
 The localizer:
 1. Connects to the RPi camera stream
-2. Detects ArUco markers in each frame
-3. Uses reference markers to establish world coordinates
-4. Tracks TurtleBot positions and orientations
-5. Optionally publishes poses via callback or saves to file
+2. Detects ArUco reference markers (required for calibration)
+3. Loads YOLO model for TurtleBot detection
+4. Tracks TurtleBot positions with consistent local IDs
+5. Transforms positions to world coordinates using homography
+6. Broadcasts positions and/or logs to CSV
 """
 
 import argparse
@@ -23,8 +28,9 @@ import logging
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Callable
 
 import cv2
 import numpy as np
@@ -33,189 +39,564 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.image_listener import ImageListener
-from utils.img_proc.image_parser import (
-    ImageParser,
-    MarkerConfig,
-    TurtleBotConfig,
-    TurtleBotPose,
-    LocalizationResult,
-    create_default_config
+from utils.core.broadcaster import PositionBroadcaster
+from utils.core.csv_writer import PositionCSVWriter
+from utils.core.sink import (
+    PositionSink,
+    TurtleBotPosition,
+    ReferenceMarkerPosition
 )
+from utils.core.position_tracker import PositionTracker, TrackedObject
+from utils.core.setup_logging import setup_logging, get_named_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Configure logging (will be called from main, but set up default logger here)
+logger = get_named_logger("localizer", __name__)
+
+
+# Default paths relative to rpi_loc root
+_THIS_DIR = Path(__file__).parent
+_RPI_LOC_ROOT = _THIS_DIR.parent
+_DEFAULT_MODEL_PATH = _RPI_LOC_ROOT / "files" / "models" / "yolo" / "runs" / "detect" / "turtlebot" / "weights" / "best.pt"
+_DEFAULT_CSV_DIR = _RPI_LOC_ROOT / "files" / "logs"
+
+
+class ReferenceMarkerError(Exception):
+    """Raised when reference markers are not detected."""
+    pass
+
+
+class StreamTimeoutError(Exception):
+    """Raised when no frames are received for too long."""
+    pass
+
+
+@dataclass
+class MarkerConfig:
+    """Configuration for a reference ArUco marker."""
+    marker_id: int
+    world_x: float
+    world_y: float
+    r_index: int = 0  # R0, R1, R2, R3 index for broadcast naming
+
+
+@dataclass
+class LocalizerConfig:
+    """Configuration for the localizer."""
+    # Stream settings
+    host: str = "100.99.98.1"
+    port: int = 5000
+    
+    # Reference markers (ArUco)
+    reference_markers: List[MarkerConfig] = None
+    aruco_dict: int = cv2.aruco.DICT_4X4_50
+    min_reference_markers: int = 4  # Minimum markers needed for homography
+    
+    # YOLO model
+    model_path: Optional[str] = None
+    confidence_threshold: float = 0.5
+    
+    # Output
+    broadcast_port: int = 5555
+    broadcast_rate_hz: float = 20.0
+    csv_rate_hz: float = 10.0
+    
+    # Timeouts
+    stream_timeout: float = 3.0  # Stop broadcasting if no frames for this long
+    
+    # Display
+    display: bool = True
+    
+    def __post_init__(self):
+        # Default reference markers (4m x 4m area) with BL as (0,0)
+        # R-index order: R0=(0,0), R1=(4,0), R2=(0,4), R3=(4,4)
+        if self.reference_markers is None:
+            self.reference_markers = [
+                MarkerConfig(marker_id=2, world_x=0.0, world_y=0.0, r_index=0),  # R0 - BL
+                MarkerConfig(marker_id=3, world_x=4.0, world_y=0.0, r_index=1),  # R1 - BR
+                MarkerConfig(marker_id=0, world_x=0.0, world_y=4.0, r_index=2),  # R2 - TL
+                MarkerConfig(marker_id=1, world_x=4.0, world_y=4.0, r_index=3),  # R3 - TR
+            ]
+
+
+class ArucoDetector:
+    """Handles ArUco marker detection."""
+    
+    def __init__(self, dictionary_type: int = cv2.aruco.DICT_4X4_50):
+        self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_type)
+        self.parameters = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
+    
+    def detect(self, frame: np.ndarray) -> Dict[int, np.ndarray]:
+        """
+        Detect ArUco markers in frame.
+        
+        Returns:
+            Dictionary mapping marker_id to corner array
+        """
+        corners, ids, _ = self.detector.detectMarkers(frame)
+        if ids is None:
+            return {}
+        return {int(ids[i][0]): corners[i] for i in range(len(ids))}
+    
+    def get_center(self, corners: np.ndarray) -> tuple:
+        """Get center point of marker from its corners."""
+        center = corners.mean(axis=1).flatten()
+        return (center[0], center[1])
+
+
+class YOLODetector:
+    """YOLO-based TurtleBot detector."""
+    
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.5
+    ):
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError(
+                "ultralytics not installed. Install with: pip install ultralytics"
+            )
+        
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"YOLO model not found: {model_path}")
+        
+        logger.info(f"Loading YOLO model from {model_path}")
+        self.model = YOLO(str(model_path))
+        self.confidence_threshold = confidence_threshold
+        self.class_names = self.model.names
+        logger.info(f"Model loaded with classes: {self.class_names}")
+    
+    def detect(self, frame: np.ndarray) -> List[Dict]:
+        """
+        Detect TurtleBots in frame.
+        
+        Returns:
+            List of detections with center, bbox, confidence, class_id
+        """
+        results = self.model(
+            frame,
+            conf=self.confidence_threshold,
+            verbose=False
+        )
+        
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
+                continue
+            
+            for i in range(len(boxes)):
+                xyxy = boxes.xyxy[i].cpu().numpy()
+                x1, y1, x2, y2 = map(int, xyxy)
+                
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                
+                detections.append({
+                    "pixel_x": cx,
+                    "pixel_y": cy,
+                    "bbox": (x1, y1, x2 - x1, y2 - y1),
+                    "confidence": float(boxes.conf[i].cpu().numpy()),
+                    "class_id": int(boxes.cls[i].cpu().numpy())
+                })
+        
+        return detections
 
 
 class TurtleBotLocalizer:
     """
-    Real-time TurtleBot localization from camera stream.
+    Real-time TurtleBot localization system.
     
-    Combines ImageListener and ImageParser to provide continuous
-    localization of TurtleBots using ArUco markers.
+    Combines image streaming, ArUco detection, YOLO detection,
+    position tracking, and data output (broadcast/CSV).
     """
     
     def __init__(
         self,
-        host: str = "100.99.98.1",
-        port: int = 5000,
-        reference_markers: Optional[List[MarkerConfig]] = None,
-        turtlebot_markers: Optional[List[TurtleBotConfig]] = None,
-        display: bool = True,
-        save_poses: Optional[str] = None,
-        on_pose_update: Optional[callable] = None
+        config: LocalizerConfig,
+        csv_path: Optional[str] = None,
+        broadcast: bool = False,
+        on_pose_update: Optional[Callable] = None
     ):
         """
         Initialize the localizer.
         
         Args:
-            host: RPi streamer host address
-            port: RPi streamer port
-            reference_markers: Reference marker configurations (or use defaults)
-            turtlebot_markers: TurtleBot marker configurations (or use defaults)
-            display: Whether to display annotated video
-            save_poses: Path to save pose history (JSON)
-            on_pose_update: Callback function(poses: List[TurtleBotPose]) for each frame
+            config: Localizer configuration
+            csv_path: Path to save CSV positions (None to disable)
+            broadcast: Whether to broadcast positions
+            on_pose_update: Callback for pose updates
         """
-        # Use default config if not provided
-        if reference_markers is None or turtlebot_markers is None:
-            ref_markers, tb_markers = create_default_config()
-            reference_markers = reference_markers or ref_markers
-            turtlebot_markers = turtlebot_markers or tb_markers
+        self.config = config
+        self.on_pose_update = on_pose_update
         
-        # Initialize parser
-        self.parser = ImageParser(reference_markers, turtlebot_markers)
+        # Initialize ArUco detector
+        self.aruco_detector = ArucoDetector(config.aruco_dict)
         
-        # Initialize listener with frame callback
+        # Build reference marker lookup
+        self.reference_markers = {
+            m.marker_id: (m.world_x, m.world_y)
+            for m in config.reference_markers
+        }
+        
+        # YOLO detector (initialized when reference markers detected)
+        self._yolo_detector: Optional[YOLODetector] = None
+        self._model_path = config.model_path or str(_DEFAULT_MODEL_PATH)
+        
+        # Position tracker
+        self.tracker = PositionTracker(
+            use_smoothing=True,
+            use_pixel_association=True  # Use pixels until homography stable
+        )
+        
+        # Homography
+        self._homography: Optional[np.ndarray] = None
+        self._homography_valid = False
+        self._calibrated = False
+        
+        # Initialize outputs
+        self._csv_writer: Optional[PositionCSVWriter] = None
+        self._broadcaster: Optional[PositionBroadcaster] = None
+        self._sink: Optional[PositionSink] = None
+        
+        if csv_path:
+            csv_path = Path(csv_path)
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            self._csv_writer = PositionCSVWriter(csv_path, rate_hz=config.csv_rate_hz)
+        
+        if broadcast:
+            self._broadcaster = PositionBroadcaster(
+                port=config.broadcast_port,
+                rate_hz=config.broadcast_rate_hz
+            )
+        
+        if self._csv_writer or self._broadcaster:
+            self._sink = PositionSink(
+                csv_writer=self._csv_writer,
+                broadcaster=self._broadcaster
+            )
+        
+        # Image listener
         self.listener = ImageListener(
-            host=host,
-            port=port,
-            display=False,  # We'll handle display ourselves
+            host=config.host,
+            port=config.port,
+            display=False,  # We handle display ourselves
             on_frame=self._on_frame
         )
         
-        self.display = display
-        self.save_poses = save_poses
-        self.on_pose_update = on_pose_update
-        
         # State
         self._running = False
-        self._pose_history: List[Dict] = []
-        self._current_poses: Dict[str, TurtleBotPose] = {}
-        self._last_result: Optional[LocalizationResult] = None
+        self._last_frame_time = 0.0
+        self._frame_count = 0
+        self._paused = False
         
-        # Display window name
+        # Display
         self._window_name = "TurtleBot Localizer"
         
-        logger.info(f"Localizer initialized - connecting to {host}:{port}")
+        logger.info(f"Localizer initialized - connecting to {config.host}:{config.port}")
+        logger.info(f"Reference markers: {list(self.reference_markers.keys())}")
     
     def _on_frame(self, frame: np.ndarray, metadata: Dict):
-        """
-        Callback for each received frame.
-        
-        Args:
-            frame: BGR image
-            metadata: Frame metadata from streamer
-        """
+        """Process each received frame."""
         timestamp = metadata.get('timestamp_ms', time.time() * 1000) / 1000.0
         frame_number = metadata.get('frame_number', 0)
         
-        # Process frame for localization
-        result = self.parser.process_frame(frame, timestamp, frame_number)
-        self._last_result = result
+        self._last_frame_time = time.time()
+        self._frame_count += 1
         
-        # Update current poses
-        for pose in result.turtlebots:
-            self._current_poses[pose.name] = pose
+        # Resume if we were paused
+        if self._paused:
+            logger.info("Stream resumed - resuming broadcast/logging")
+            self._paused = False
+            if self._sink:
+                self._sink.resume()
         
-        # Save pose history if enabled
-        if self.save_poses:
-            self._record_poses(result)
+        # Step 1: Detect ArUco reference markers
+        markers = self.aruco_detector.detect(frame)
+        ref_markers_found = [mid for mid in markers if mid in self.reference_markers]
         
-        # Call user callback if provided
-        if self.on_pose_update and result.turtlebots:
-            self.on_pose_update(result.turtlebots)
-        
-        # Display annotated frame
-        if self.display:
-            annotated = self.parser.draw_detections(frame, result)
-            self._draw_extra_info(annotated, metadata)
-            cv2.imshow(self._window_name, annotated)
+        # Step 2: Update homography if enough markers
+        if len(ref_markers_found) >= self.config.min_reference_markers:
+            self._update_homography(markers)
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                self._running = False
-            elif key == ord('c'):
-                # Calibration mode - print detected marker positions
-                self._print_calibration_info()
-            elif key == ord('s'):
-                # Save current frame
-                self._save_snapshot(annotated, frame_number)
+            # First time we have valid calibration
+            if not self._calibrated and self._homography_valid:
+                logger.info("Calibration complete - all reference markers detected")
+                self._calibrated = True
+                
+                # Load YOLO model now
+                if self._yolo_detector is None:
+                    self._load_yolo_model()
+        
+        elif not self._calibrated:
+            # Not yet calibrated - show waiting message
+            if self._frame_count % 30 == 0:
+                logger.warning(
+                    f"Waiting for reference markers: found {ref_markers_found}, "
+                    f"need {self.config.min_reference_markers}"
+                )
+            
+            if self.config.display:
+                self._draw_calibration_frame(frame, markers, ref_markers_found)
+            return
+        
+        # Step 3: Detect TurtleBots with YOLO
+        turtlebot_detections = []
+        if self._yolo_detector:
+            yolo_detections = self._yolo_detector.detect(frame)
+            
+            # Transform to world coordinates
+            for det in yolo_detections:
+                world_x, world_y = self._transform_to_world(
+                    det["pixel_x"], det["pixel_y"]
+                )
+                det["x"] = world_x
+                det["y"] = world_y
+                det["theta"] = 0.0  # YOLO doesn't give orientation
+                det["name"] = f"turtlebot"
+                turtlebot_detections.append(det)
+        
+        # Step 4: Update tracker
+        tracked = self.tracker.update(
+            turtlebot_detections,
+            timestamp,
+            homography_valid=self._homography_valid
+        )
+        
+        # Step 5: Publish positions
+        if self._sink:
+            # Build TurtleBot positions
+            positions = [
+                TurtleBotPosition(
+                    name=obj.name,
+                    local_id=obj.local_id,
+                    x=obj.smoothed_position[0],
+                    y=obj.smoothed_position[1],
+                    theta=obj.smoothed_position[2],
+                    confidence=obj.current_position.confidence if obj.current_position else 0.0,
+                    pixel_x=obj.current_position.pixel_x if obj.current_position else 0,
+                    pixel_y=obj.current_position.pixel_y if obj.current_position else 0,
+                    timestamp=timestamp
+                )
+                for obj in tracked
+            ]
+            
+            # Build reference marker positions
+            # R0=(0,0), R1=(4,0), R2=(0,4), R3=(4,4)
+            ref_marker_positions = []
+            for marker_id, marker_cfg in self.reference_markers.items():
+                detected = marker_id in markers
+                pixel_x, pixel_y = 0, 0
+                if detected:
+                    pixel_x, pixel_y = self.aruco_detector.get_center(markers[marker_id])
+                    pixel_x, pixel_y = int(pixel_x), int(pixel_y)
+                
+                ref_marker_positions.append(ReferenceMarkerPosition(
+                    name=f"R{marker_cfg.r_index}",
+                    marker_id=marker_id,
+                    world_x=marker_cfg.world_x,
+                    world_y=marker_cfg.world_y,
+                    pixel_x=pixel_x,
+                    pixel_y=pixel_y,
+                    detected=detected
+                ))
+            
+            self._sink.publish(
+                positions,
+                ref_marker_positions,
+                timestamp,
+                frame_number,
+                self._homography_valid
+            )
+        
+        # Step 6: Call user callback
+        if self.on_pose_update and tracked:
+            self.on_pose_update(tracked)
+        
+        # Step 7: Display
+        if self.config.display:
+            self._draw_frame(frame, markers, ref_markers_found, tracked)
     
-    def _draw_extra_info(self, frame: np.ndarray, metadata: Dict):
-        """Draw additional info on frame."""
-        # Draw stream info in top-right
-        h, w = frame.shape[:2]
-        info_lines = [
-            f"Device: {metadata.get('device_id', '?')}",
-            f"Frame: {metadata.get('frame_number', '?')}",
-            f"Stream FPS: {self.listener.fps:.1f}"
+    def _load_yolo_model(self):
+        """Load the YOLO model."""
+        try:
+            self._yolo_detector = YOLODetector(
+                self._model_path,
+                confidence_threshold=self.config.confidence_threshold
+            )
+            logger.info("YOLO model loaded successfully")
+        except FileNotFoundError as e:
+            logger.error(f"YOLO model not found: {e}")
+            raise ReferenceMarkerError(
+                f"YOLO model not found at {self._model_path}. "
+                "Train a model with 'yolo_loc train' or provide --model path."
+            )
+        except Exception as e:
+            logger.error(f"Failed to load YOLO model: {e}")
+            raise
+    
+    def _update_homography(self, markers: Dict[int, np.ndarray]):
+        """Update homography matrix from detected markers."""
+        image_points = []
+        world_points = []
+        
+        for marker_id, world_pos in self.reference_markers.items():
+            if marker_id in markers:
+                center = self.aruco_detector.get_center(markers[marker_id])
+                image_points.append(center)
+                world_points.append(world_pos)
+        
+        if len(image_points) >= 4:
+            image_pts = np.array(image_points, dtype=np.float32)
+            world_pts = np.array(world_points, dtype=np.float32)
+            
+            self._homography, _ = cv2.findHomography(
+                image_pts, world_pts, cv2.RANSAC, 5.0
+            )
+            self._homography_valid = self._homography is not None
+    
+    def _transform_to_world(self, pixel_x: float, pixel_y: float) -> tuple:
+        """Transform pixel coordinates to world coordinates."""
+        if self._homography_valid:
+            point = np.array([[pixel_x, pixel_y]], dtype=np.float32).reshape(-1, 1, 2)
+            world = cv2.perspectiveTransform(point, self._homography)
+            return float(world[0, 0, 0]), float(world[0, 0, 1])
+        return pixel_x, pixel_y
+    
+    def _draw_calibration_frame(
+        self,
+        frame: np.ndarray,
+        markers: Dict[int, np.ndarray],
+        found_refs: List[int]
+    ):
+        """Draw frame during calibration phase."""
+        output = frame.copy()
+        
+        # Draw detected markers
+        if markers:
+            corners = list(markers.values())
+            ids = np.array([[mid] for mid in markers.keys()])
+            cv2.aruco.drawDetectedMarkers(output, corners, ids)
+        
+        # Draw status
+        h, w = output.shape[:2]
+        
+        # Semi-transparent overlay
+        overlay = output.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 80), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, output, 0.3, 0, output)
+        
+        # Status text
+        status = f"CALIBRATING - Detecting reference markers..."
+        cv2.putText(output, status, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        found_str = f"Found: {found_refs}"
+        needed_str = f"Need: {list(self.reference_markers.keys())}"
+        cv2.putText(output, found_str, (10, 55),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(output, needed_str, (10, 75),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        cv2.imshow(self._window_name, output)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            self._running = False
+    
+    def _draw_frame(
+        self,
+        frame: np.ndarray,
+        markers: Dict[int, np.ndarray],
+        found_refs: List[int],
+        tracked: List[TrackedObject]
+    ):
+        """Draw annotated frame."""
+        output = frame.copy()
+        
+        # Draw reference markers
+        if markers:
+            corners = list(markers.values())
+            ids = np.array([[mid] for mid in markers.keys()])
+            cv2.aruco.drawDetectedMarkers(output, corners, ids)
+        
+        # Colors for different TurtleBots
+        colors = [
+            (0, 0, 255),    # Red
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 255, 255),  # Yellow
+            (255, 0, 255),  # Magenta
         ]
         
-        y = 25
-        for line in info_lines:
-            text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-            x = w - text_size[0] - 10
-            cv2.putText(frame, line, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-            y += 20
-        
-        # Draw TurtleBot pose summary
-        y = 25
-        for name, pose in self._current_poses.items():
-            if self._last_result and self._last_result.homography_valid:
-                text = f"{name}: x={pose.x:.3f} y={pose.y:.3f} θ={np.degrees(pose.theta):.1f}°"
+        # Draw tracked TurtleBots
+        for obj in tracked:
+            pos = obj.current_position
+            if pos is None:
+                continue
+            
+            color = colors[(obj.local_id - 1) % len(colors)]
+            px, py = pos.pixel_x, pos.pixel_y
+            
+            # Draw center point
+            cv2.circle(output, (px, py), 10, color, -1)
+            cv2.circle(output, (px, py), 12, (255, 255, 255), 2)
+            
+            # Draw label
+            x, y, _ = obj.smoothed_position
+            if self._homography_valid:
+                label = f"{obj.name} (ID:{obj.local_id}): ({x:.2f}, {y:.2f})m"
             else:
-                text = f"{name}: px=({pose.pixel_position[0]}, {pose.pixel_position[1]})"
-            cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            y += 20
-    
-    def _record_poses(self, result: LocalizationResult):
-        """Record poses to history."""
-        record = {
-            "timestamp": result.timestamp,
-            "frame_number": result.frame_number,
-            "homography_valid": result.homography_valid,
-            "poses": [
-                {
-                    "name": p.name,
-                    "x": p.x,
-                    "y": p.y,
-                    "theta": p.theta,
-                    "confidence": p.confidence
-                }
-                for p in result.turtlebots
-            ]
-        }
-        self._pose_history.append(record)
-    
-    def _print_calibration_info(self):
-        """Print calibration information for setting up markers."""
-        logger.info("=== Calibration Info ===")
-        logger.info("Detected reference markers:")
+                label = f"{obj.name} (ID:{obj.local_id}): ({px}, {py})px"
+            
+            label += f" [{pos.confidence:.0%}]"
+            
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(output, (px + 15, py - th - 5), (px + 20 + tw, py + 5), (0, 0, 0), -1)
+            cv2.putText(output, label, (px + 18, py),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # Re-detect to get current marker positions
-        # This would need access to the current frame
-        logger.info("Press 'c' while viewing a frame with all markers visible")
-        logger.info("to capture their pixel positions for calibration.")
+        # Draw status bar
+        h, w = output.shape[:2]
+        
+        status = f"Refs: {len(found_refs)}/{len(self.reference_markers)} | "
+        status += f"Homography: {'OK' if self._homography_valid else 'NO'} | "
+        status += f"TurtleBots: {len(tracked)}"
+        
+        if self._broadcaster:
+            status += f" | Clients: {self._broadcaster.client_count}"
+        
+        cv2.rectangle(output, (0, h - 35), (w, h), (0, 0, 0), -1)
+        cv2.putText(output, status, (10, h - 12),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        cv2.imshow(self._window_name, output)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            self._running = False
+        elif key == ord('r'):
+            # Reset calibration
+            self._calibrated = False
+            self._homography_valid = False
+            self.tracker.reset()
+            logger.info("Calibration reset")
     
-    def _save_snapshot(self, frame: np.ndarray, frame_number: int):
-        """Save current frame as snapshot."""
-        filename = f"snapshot_{frame_number:06d}.jpg"
-        cv2.imwrite(filename, frame)
-        logger.info(f"Saved snapshot: {filename}")
+    def _check_stream_timeout(self):
+        """Check if stream has timed out."""
+        if self._last_frame_time == 0:
+            return
+        
+        elapsed = time.time() - self._last_frame_time
+        
+        if elapsed > self.config.stream_timeout and not self._paused:
+            logger.warning(
+                f"No frames for {elapsed:.1f}s - pausing broadcast/logging"
+            )
+            self._paused = True
+            if self._sink:
+                self._sink.pause()
     
     def start(self, auto_reconnect: bool = True):
         """
@@ -226,8 +607,24 @@ class TurtleBotLocalizer:
         """
         self._running = True
         
+        # Start broadcaster if configured
+        if self._broadcaster:
+            if not self._broadcaster.start():
+                logger.error("Failed to start broadcaster")
+                return
+        
         logger.info("Starting TurtleBot Localizer...")
-        logger.info("Controls: q=quit, c=calibration info, s=save snapshot")
+        logger.info("Controls: q=quit, r=reset calibration")
+        
+        # Start timeout checker thread
+        import threading
+        def timeout_checker():
+            while self._running:
+                self._check_stream_timeout()
+                time.sleep(0.5)
+        
+        timeout_thread = threading.Thread(target=timeout_checker, daemon=True)
+        timeout_thread.start()
         
         try:
             self.listener.start(auto_reconnect=auto_reconnect)
@@ -237,64 +634,66 @@ class TurtleBotLocalizer:
             self.stop()
     
     def stop(self):
-        """Stop the localizer and save data."""
+        """Stop the localizer."""
         self._running = False
         self.listener.stop()
         
-        if self.display:
+        if self.config.display:
             cv2.destroyAllWindows()
         
-        # Save pose history
-        if self.save_poses and self._pose_history:
-            with open(self.save_poses, 'w') as f:
-                json.dump(self._pose_history, f, indent=2)
-            logger.info(f"Saved {len(self._pose_history)} pose records to {self.save_poses}")
+        if self._sink:
+            self._sink.close()
         
         # Print statistics
-        stats = self.parser.stats
-        logger.info(f"Localizer stopped. Stats: {stats}")
-    
-    def get_poses(self) -> Dict[str, TurtleBotPose]:
-        """Get current TurtleBot poses."""
-        return self._current_poses.copy()
-    
-    def get_pose(self, name: str) -> Optional[TurtleBotPose]:
-        """Get pose for a specific TurtleBot."""
-        return self._current_poses.get(name)
+        logger.info(f"Localizer stopped. Processed {self._frame_count} frames")
+        logger.info(f"Tracker stats: {self.tracker.stats}")
 
 
-def load_config(config_path: str) -> tuple:
+def load_config(config_path: str) -> LocalizerConfig:
     """
-    Load marker configuration from JSON file.
+    Load localizer configuration from JSON file.
     
-    Config format:
+    Expected format:
     {
+        "host": "100.99.98.1",
+        "port": 5000,
         "reference_markers": [
             {"id": 0, "x": 0.0, "y": 0.0},
             {"id": 1, "x": 2.0, "y": 0.0},
             ...
         ],
-        "turtlebot_markers": [
-            {"id": 10, "name": "tb3_0"},
-            {"id": 11, "name": "tb3_1"},
-            ...
-        ]
+        "model_path": "path/to/model.pt",
+        "confidence_threshold": 0.5,
+        "broadcast_port": 5555,
+        "stream_timeout": 3.0
     }
     """
     with open(config_path, 'r') as f:
-        config = json.load(f)
+        data = json.load(f)
     
-    ref_markers = [
-        MarkerConfig(marker_id=m['id'], world_position=(m['x'], m['y']))
-        for m in config.get('reference_markers', [])
-    ]
+    ref_markers = None
+    if "reference_markers" in data:
+        ref_markers = [
+            MarkerConfig(
+                marker_id=m["id"],
+                world_x=m["x"],
+                world_y=m["y"]
+            )
+            for m in data["reference_markers"]
+        ]
     
-    tb_markers = [
-        TurtleBotConfig(marker_id=m['id'], name=m['name'])
-        for m in config.get('turtlebot_markers', [])
-    ]
-    
-    return ref_markers, tb_markers
+    return LocalizerConfig(
+        host=data.get("host", "100.99.98.1"),
+        port=data.get("port", 5000),
+        reference_markers=ref_markers,
+        model_path=data.get("model_path"),
+        confidence_threshold=data.get("confidence_threshold", 0.5),
+        broadcast_port=data.get("broadcast_port", 5555),
+        broadcast_rate_hz=data.get("broadcast_rate_hz", 20.0),
+        csv_rate_hz=data.get("csv_rate_hz", 10.0),
+        stream_timeout=data.get("stream_timeout", 3.0),
+        display=data.get("display", True)
+    )
 
 
 def main():
@@ -303,42 +702,65 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    Basic usage:
-        python localizer.py
+    Basic usage (display only):
+        python localizer.py --host 100.99.98.1
     
-    With custom host:
-        python localizer.py --host 100.99.98.1 --port 5000
+    With broadcasting:
+        python localizer.py --host 100.99.98.1 --broadcast
     
-    Save pose history:
-        python localizer.py --save-poses poses.json
+    With CSV logging:
+        python localizer.py --host 100.99.98.1 --csv positions.csv
     
-    Load custom marker config:
-        python localizer.py --config markers.json
+    Full setup:
+        python localizer.py --host 100.99.98.1 --broadcast --csv positions.csv
     
-    Headless mode:
-        python localizer.py --no-display --save-poses poses.json
+    Custom model:
+        python localizer.py --host 100.99.98.1 --model path/to/best.pt
+    
+    Load config from file:
+        python localizer.py --config localizer_config.json
 
 Controls (when display is enabled):
     q - Quit
-    c - Print calibration info
-    s - Save current frame as snapshot
+    r - Reset calibration
         """
     )
     
     parser.add_argument("--host", default="100.99.98.1",
                        help="Streamer host address (default: 100.99.98.1)")
     parser.add_argument("--port", type=int, default=5000,
-                       help="Streamer port number (default: 5000)")
-    parser.add_argument("--config", type=str, default=None,
-                       help="Path to marker configuration JSON file")
-    parser.add_argument("--save-poses", type=str, default=None,
-                       help="Path to save pose history (JSON)")
+                       help="Streamer port (default: 5000)")
+    parser.add_argument("--config", type=str,
+                       help="Path to JSON configuration file")
+    parser.add_argument("--model", "-m", type=str,
+                       help="Path to YOLO model (default: files/models/yolo/.../best.pt)")
+    parser.add_argument("--confidence", type=float, default=0.5,
+                       help="Detection confidence threshold (default: 0.5)")
+    parser.add_argument("--broadcast", "-b", action="store_true",
+                       help="Enable position broadcasting")
+    parser.add_argument("--broadcast-port", type=int, default=5555,
+                       help="Broadcast port (default: 5555)")
+    parser.add_argument("--csv", type=str,
+                       help="Path to save CSV positions")
     parser.add_argument("--no-display", action="store_true",
                        help="Disable display window")
     parser.add_argument("--no-reconnect", action="store_true",
                        help="Disable auto-reconnect")
+    parser.add_argument("--timeout", type=float, default=3.0,
+                       help="Stream timeout in seconds (default: 3.0)")
+    parser.add_argument("--log-level", default="info",
+                       choices=["debug", "info", "warning", "error"],
+                       help="Logging level (default: info)")
     
     args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(
+        experiment_name="localizer",
+        level=args.log_level,
+        log_to_file=True,
+        log_to_console=True
+    )
     
     # Setup signal handlers
     def signal_handler(sig, frame):
@@ -348,20 +770,26 @@ Controls (when display is enabled):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Load configuration
-    ref_markers, tb_markers = None, None
+    # Load or create configuration
     if args.config:
-        ref_markers, tb_markers = load_config(args.config)
+        config = load_config(args.config)
         logger.info(f"Loaded config from {args.config}")
+    else:
+        config = LocalizerConfig(
+            host=args.host,
+            port=args.port,
+            model_path=args.model,
+            confidence_threshold=args.confidence,
+            broadcast_port=args.broadcast_port,
+            stream_timeout=args.timeout,
+            display=not args.no_display
+        )
     
     # Create and start localizer
     localizer = TurtleBotLocalizer(
-        host=args.host,
-        port=args.port,
-        reference_markers=ref_markers,
-        turtlebot_markers=tb_markers,
-        display=not args.no_display,
-        save_poses=args.save_poses
+        config=config,
+        csv_path=args.csv,
+        broadcast=args.broadcast
     )
     
     localizer.start(auto_reconnect=not args.no_reconnect)

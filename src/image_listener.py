@@ -28,13 +28,9 @@ import numpy as np
 # Add parent directory to path for imports
 sys.path.insert(0, str(__file__).rsplit('/', 2)[0])
 from utils.common import recv_frame
+from utils.core.setup_logging import setup_logging, get_named_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = get_named_logger("listener", __name__)
 
 
 class ImageListener:
@@ -425,6 +421,13 @@ Controls (when display is enabled):
                        help="Show text overlay on display")
     
     args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(
+        experiment_name="listener",
+        log_to_file=True,
+        log_to_console=True
+    )
     
     # Setup signal handlers
     def signal_handler(sig, frame):

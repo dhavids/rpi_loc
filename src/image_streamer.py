@@ -41,13 +41,9 @@ from utils.common import (
     get_hostname,
     StreamConfig
 )
+from utils.core.setup_logging import setup_logging, get_named_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = get_named_logger("streamer", __name__)
 
 
 def get_pi_power_stats() -> dict:
@@ -614,6 +610,13 @@ Note:
                            help="640x480 @ 30fps")
     
     args = parser.parse_args()
+    
+    # Setup logging
+    setup_logging(
+        experiment_name="streamer",
+        log_to_file=True,
+        log_to_console=True
+    )
     
     # Determine resolution, fps, and sensor mode from mode or explicit args
     crop_square = 0  # No square cropping by default

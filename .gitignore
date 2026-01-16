@@ -6,11 +6,8 @@ __pycache__/
 # C extensions
 *.so
 
-# Ignore data folder
-data/
-
-# Ignore runs folder
-runs/
+# Ignore files folder
+files/
 
 # Ignore .pt model files
 *.pt

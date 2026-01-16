@@ -10,14 +10,14 @@ Provides command-line interface for:
 - Evaluating models
 
 Usage:
-    python -m rpi_loc.src.models.yolo.cli collect --camera 0 --output data/images
-    python -m rpi_loc.src.models.yolo.cli annotate --images data/images --labels data/labels
-    python -m rpi_loc.src.models.yolo.cli create-dataset --images data/images --labels data/labels --output data/dataset
-    python -m rpi_loc.src.models.yolo.cli train --data data/dataset --epochs 100
-    python -m rpi_loc.src.models.yolo.cli finetune --data data/dataset --base-model yolov8n.pt --epochs 50
-    python -m rpi_loc.src.models.yolo.cli evaluate --model runs/train/best.pt --data data/dataset
-    python -m rpi_loc.src.models.yolo.cli predict --model runs/train/best.pt --source test_images/
-    python -m rpi_loc.src.models.yolo.cli export --model runs/train/best.pt --format onnx
+    yolo_loc collect --stream --output data/images
+    yolo_loc annotate --images data/images --labels data/labels
+    yolo_loc create-dataset --images data/images --labels data/labels --output data/dataset
+    yolo_loc train --data data/dataset --epochs 100
+    yolo_loc finetune --data data/dataset --base-model yolov8n.pt --epochs 50
+    yolo_loc evaluate --model runs/train/best.pt --data data/dataset
+    yolo_loc predict --model runs/train/best.pt --source test_images/
+    yolo_loc export --model runs/train/best.pt --format onnx
 """
 
 import argparse
@@ -30,6 +30,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Default paths relative to this file's location
+# Structure: rpi_loc/src/models/yolo/cli.py -> rpi_loc/files/models/yolo/
+_THIS_DIR = Path(__file__).parent
+_FILES_DIR = _THIS_DIR.parent.parent.parent / "files" / "models" / "yolo"
+DEFAULT_DATA_DIR = _FILES_DIR / "data"
+DEFAULT_RUNS_DIR = _FILES_DIR / "runs"
+DEFAULT_IMAGES_DIR = DEFAULT_DATA_DIR / "images"
+DEFAULT_LABELS_DIR = DEFAULT_DATA_DIR / "labels"
+DEFAULT_DATASET_DIR = DEFAULT_DATA_DIR / "dataset"
+
+
+def _get_default_path(path_type: str) -> str:
+    """Get default path, creating directory if needed."""
+    paths = {
+        "images": DEFAULT_IMAGES_DIR,
+        "labels": DEFAULT_LABELS_DIR,
+        "dataset": DEFAULT_DATASET_DIR,
+        "data": DEFAULT_DATA_DIR,
+        "runs": DEFAULT_RUNS_DIR,
+    }
+    path = paths.get(path_type, DEFAULT_DATA_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 def cmd_collect(args):
@@ -253,7 +277,8 @@ def cmd_predict(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YOLO TurtleBot Detection Training CLI"
+        description="YOLO TurtleBot Detection Training CLI",
+        prog="yolo_loc"
     )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
     
@@ -266,7 +291,7 @@ def main():
     p_collect.add_argument("--port", type=int, default=5000, help="RPi stream port")
     p_collect.add_argument("--duration", type=float, help="Auto-collect duration in seconds")
     p_collect.add_argument("--preview", action="store_true", help="Show preview during timed collect")
-    p_collect.add_argument("--output", "-o", default="collected_images", help="Output directory")
+    p_collect.add_argument("--output", "-o", default=None, help=f"Output directory (default: {DEFAULT_IMAGES_DIR})")
     p_collect.add_argument("--interval", type=float, default=0, help="Auto-capture interval (seconds)")
     p_collect.add_argument("--max-images", type=int, default=0, help="Maximum images to collect")
     p_collect.add_argument("--every-n", type=int, default=30, help="Extract every N frames (video)")
@@ -274,17 +299,17 @@ def main():
     
     # Annotate command
     p_annotate = subparsers.add_parser("annotate", help="Annotate images")
-    p_annotate.add_argument("--images", "-i", required=True, help="Images directory")
-    p_annotate.add_argument("--labels", "-l", required=True, help="Labels directory")
+    p_annotate.add_argument("--images", "-i", default=None, help=f"Images directory (default: {DEFAULT_IMAGES_DIR})")
+    p_annotate.add_argument("--labels", "-l", default=None, help=f"Labels directory (default: {DEFAULT_LABELS_DIR})")
     p_annotate.add_argument("--classes", "-c", default="turtlebot", help="Comma-separated class names")
     p_annotate.add_argument("--progress", action="store_true", help="Show progress only")
     p_annotate.set_defaults(func=cmd_annotate)
     
     # Create dataset command
     p_dataset = subparsers.add_parser("create-dataset", help="Create train/val/test split")
-    p_dataset.add_argument("--images", "-i", help="Images directory (optional if creating empty structure)")
-    p_dataset.add_argument("--labels", "-l", help="Labels directory (optional if creating empty structure)")
-    p_dataset.add_argument("--output", "-o", required=True, help="Output dataset directory")
+    p_dataset.add_argument("--images", "-i", default=None, help=f"Images directory (default: {DEFAULT_IMAGES_DIR})")
+    p_dataset.add_argument("--labels", "-l", default=None, help=f"Labels directory (default: {DEFAULT_LABELS_DIR})")
+    p_dataset.add_argument("--output", "-o", default=None, help=f"Output dataset directory (default: {DEFAULT_DATASET_DIR})")
     p_dataset.add_argument("--classes", "-c", default="turtlebot", help="Comma-separated class names")
     p_dataset.add_argument("--train-ratio", type=float, default=0.8)
     p_dataset.add_argument("--val-ratio", type=float, default=0.15)
@@ -295,7 +320,7 @@ def main():
     
     # Train command
     p_train = subparsers.add_parser("train", help="Train YOLO model")
-    p_train.add_argument("--data", "-d", required=True, help="Dataset directory or data.yaml")
+    p_train.add_argument("--data", "-d", default=None, help=f"Dataset directory or data.yaml (default: {DEFAULT_DATASET_DIR})")
     p_train.add_argument("--base-model", default="yolov8n.pt", help="Base model")
     p_train.add_argument("--epochs", type=int, default=100)
     p_train.add_argument("--batch-size", type=int, default=16)
@@ -308,7 +333,7 @@ def main():
     
     # Fine-tune command
     p_finetune = subparsers.add_parser("finetune", help="Fine-tune pretrained model")
-    p_finetune.add_argument("--data", "-d", required=True, help="Dataset directory or data.yaml")
+    p_finetune.add_argument("--data", "-d", default=None, help=f"Dataset directory or data.yaml (default: {DEFAULT_DATASET_DIR})")
     p_finetune.add_argument("--base-model", default="yolov8n.pt", help="Pretrained model")
     p_finetune.add_argument("--epochs", type=int, default=50)
     p_finetune.add_argument("--batch-size", type=int, default=16)
@@ -319,7 +344,7 @@ def main():
     # Evaluate command
     p_eval = subparsers.add_parser("evaluate", help="Evaluate model")
     p_eval.add_argument("--model", "-m", required=True, help="Model path")
-    p_eval.add_argument("--data", "-d", help="Dataset directory or data.yaml")
+    p_eval.add_argument("--data", "-d", default=None, help=f"Dataset directory or data.yaml (default: {DEFAULT_DATASET_DIR})")
     p_eval.set_defaults(func=cmd_evaluate)
     
     # Export command
@@ -342,6 +367,22 @@ def main():
     if args.command is None:
         parser.print_help()
         sys.exit(1)
+    
+    # Apply defaults for paths if not provided
+    if hasattr(args, 'output') and args.output is None:
+        if args.command == "collect":
+            args.output = _get_default_path("images")
+        elif args.command == "create-dataset":
+            args.output = _get_default_path("dataset")
+    
+    if hasattr(args, 'images') and args.images is None:
+        args.images = _get_default_path("images")
+    
+    if hasattr(args, 'labels') and args.labels is None:
+        args.labels = _get_default_path("labels")
+    
+    if hasattr(args, 'data') and args.data is None:
+        args.data = _get_default_path("dataset")
     
     args.func(args)
 

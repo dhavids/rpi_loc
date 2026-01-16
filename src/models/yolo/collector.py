@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple, Dict, Any
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+# Add parent to path for imports
+import sys
+sys.path.insert(0, str(Path(__file__).parents[3]))
+from utils.core.setup_logging import get_named_logger
+
+logger = get_named_logger("collector", __name__)
 
 try:
     import cv2

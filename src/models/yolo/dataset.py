@@ -15,7 +15,11 @@ from typing import Dict, List, Optional, Tuple
 import json
 import yaml
 
-logger = logging.getLogger(__name__)
+import sys
+sys.path.insert(0, str(Path(__file__).parents[3]))
+from utils.core.setup_logging import get_named_logger
+
+logger = get_named_logger("dataset", __name__)
 
 try:
     import cv2
