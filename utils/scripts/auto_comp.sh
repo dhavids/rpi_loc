@@ -63,18 +63,20 @@ alias rpi_act="source $RPI_LOC_ENV/bin/activate"
 # =============================================================================
 
 if [ "$IS_RPI" = true ]; then
-    # Remove any conflicting alias before defining functions
-    unalias rpi_loc 2>/dev/null
-    unalias run_rpi_loc 2>/dev/null
+    # Remove any conflicting alias/function before defining functions
+    unalias rpi_loc 2>/dev/null || true
+    unalias run_rpi_loc 2>/dev/null || true
+    unset -f rpi_loc 2>/dev/null || true
+    unset -f run_rpi_loc 2>/dev/null || true
 
     # Activate environment and run the image streamer
-    rpi_loc() {
+    function rpi_loc() {
         source "$RPI_LOC_ENV/bin/activate"
         python "$RPI_LOC_ROOT/src/image_streamer.py" --binned "$@"
     }
 
     # Run image streamer only (assumes environment is already active)
-    run_rpi_loc() {
+    function run_rpi_loc() {
         if [ -z "$VIRTUAL_ENV" ]; then
             echo "Warning: Virtual environment not active. Run 'rpi_act' first or use 'rpi_loc' instead."
         fi
