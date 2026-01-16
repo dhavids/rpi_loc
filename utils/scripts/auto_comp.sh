@@ -70,7 +70,7 @@ if [ "$IS_RPI" = true ]; then
     # Activate environment and run the image streamer
     rpi_loc() {
         source "$RPI_LOC_ENV/bin/activate"
-        python "$RPI_LOC_ROOT/src/image_streamer.py" "$@"
+        python "$RPI_LOC_ROOT/src/image_streamer.py --binned" "$@"
     }
 
     # Run image streamer only (assumes environment is already active)
