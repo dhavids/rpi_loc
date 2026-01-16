@@ -48,6 +48,7 @@ from utils.core.sink import (
 )
 from utils.core.position_tracker import PositionTracker, TrackedObject
 from utils.core.setup_logging import setup_logging, get_named_logger
+from utils.core.plotter import PositionPlotter
 
 # Configure logging (will be called from main, but set up default logger here)
 logger = get_named_logger("localizer", __name__)
@@ -56,7 +57,7 @@ logger = get_named_logger("localizer", __name__)
 # Default paths relative to rpi_loc root
 _THIS_DIR = Path(__file__).parent
 _RPI_LOC_ROOT = _THIS_DIR.parent
-_DEFAULT_MODEL_PATH = _RPI_LOC_ROOT / "files" / "models" / "yolo" / "runs" / "detect" / "turtlebot" / "weights" / "best.pt"
+_DEFAULT_MODEL_PATH = _RPI_LOC_ROOT / "files" / "models" / "yolo" / "runs" / "detect" / "runs" / "train" / "turtlebot" / "weights" / "best.pt"
 _DEFAULT_CSV_DIR = _RPI_LOC_ROOT / "files" / "logs"
 
 
@@ -107,14 +108,14 @@ class LocalizerConfig:
     display: bool = True
     
     def __post_init__(self):
-        # Default reference markers (4m x 4m area) with BL as (0,0)
-        # R-index order: R0=(0,0), R1=(4,0), R2=(0,4), R3=(4,4)
+        # Default reference markers (4m x 4m area) with TR as (0,0) and BL as (4,4)
+        # R-index order: R0=(0,0), R1=(0,3.5), R2=(0,4), R3=(4,3.5)
         if self.reference_markers is None:
             self.reference_markers = [
-                MarkerConfig(marker_id=2, world_x=0.0, world_y=0.0, r_index=0),  # R0 - BL
-                MarkerConfig(marker_id=3, world_x=4.0, world_y=0.0, r_index=1),  # R1 - BR
-                MarkerConfig(marker_id=0, world_x=0.0, world_y=4.0, r_index=2),  # R2 - TL
-                MarkerConfig(marker_id=1, world_x=4.0, world_y=4.0, r_index=3),  # R3 - TR
+                MarkerConfig(marker_id=2, world_x=0.0, world_y=0.0, r_index=0),  # R0 - TR
+                MarkerConfig(marker_id=3, world_x=4.0, world_y=0.0, r_index=1),  # R1 - TL (moved)
+                MarkerConfig(marker_id=0, world_x=0.0, world_y=3.5, r_index=2),  # R2 - BR
+                MarkerConfig(marker_id=1, world_x=4.0, world_y=3.5, r_index=3),  # R3 - BL
             ]
 
 
@@ -124,7 +125,37 @@ class ArucoDetector:
     def __init__(self, dictionary_type: int = cv2.aruco.DICT_4X4_50):
         self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_type)
         self.parameters = cv2.aruco.DetectorParameters()
+        
+        # Tune parameters for better detection in poor lighting conditions
+        # Adaptive thresholding - use smaller window for local contrast
+        self.parameters.adaptiveThreshWinSizeMin = 3
+        self.parameters.adaptiveThreshWinSizeMax = 23
+        self.parameters.adaptiveThreshWinSizeStep = 10
+        self.parameters.adaptiveThreshConstant = 7
+        
+        # Reduce minimum marker perimeter to detect smaller/distant markers
+        self.parameters.minMarkerPerimeterRate = 0.01  # Default: 0.03
+        self.parameters.maxMarkerPerimeterRate = 4.0   # Default: 4.0
+        
+        # Be more lenient with marker shape
+        self.parameters.polygonalApproxAccuracyRate = 0.05  # Default: 0.03
+        self.parameters.minCornerDistanceRate = 0.01  # Default: 0.05
+        
+        # Corner refinement for better accuracy
+        self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.parameters.cornerRefinementWinSize = 5
+        self.parameters.cornerRefinementMaxIterations = 50
+        self.parameters.cornerRefinementMinAccuracy = 0.1
+        
+        # Error correction - allow more bit errors for damaged/occluded markers
+        self.parameters.errorCorrectionRate = 0.8  # Default: 0.6
+        
+        # Perspective removal - helps with angled markers
+        self.parameters.perspectiveRemovePixelPerCell = 8  # Default: 4
+        self.parameters.perspectiveRemoveIgnoredMarginPerCell = 0.13
+        
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
+        logger.info("ArUco detector initialized with enhanced low-light parameters")
     
     def detect(self, frame: np.ndarray) -> Dict[int, np.ndarray]:
         """
@@ -219,6 +250,7 @@ class TurtleBotLocalizer:
         config: LocalizerConfig,
         csv_path: Optional[str] = None,
         broadcast: bool = False,
+        plot: bool = False,
         on_pose_update: Optional[Callable] = None
     ):
         """
@@ -236,9 +268,9 @@ class TurtleBotLocalizer:
         # Initialize ArUco detector
         self.aruco_detector = ArucoDetector(config.aruco_dict)
         
-        # Build reference marker lookup
+        # Build reference marker lookup (keep full MarkerConfig objects)
         self.reference_markers = {
-            m.marker_id: (m.world_x, m.world_y)
+            m.marker_id: m
             for m in config.reference_markers
         }
         
@@ -273,6 +305,17 @@ class TurtleBotLocalizer:
                 rate_hz=config.broadcast_rate_hz
             )
         
+        # Plotter
+        self._plotter: Optional[PositionPlotter] = None
+        if plot:
+            self._plotter = PositionPlotter(
+                decay_seconds=15.0,
+                trail_seconds=10.0,
+                refresh_interval=0.2,
+                velocity_scale=0.5,
+                show_pos=True
+            )
+        
         if self._csv_writer or self._broadcaster:
             self._sink = PositionSink(
                 csv_writer=self._csv_writer,
@@ -295,9 +338,14 @@ class TurtleBotLocalizer:
         
         # Display
         self._window_name = "TurtleBot Localizer"
+        self._screen_size = self._get_screen_size()
+        self._max_display_width = int(self._screen_size[0] * 0.9)  # 90% of screen
+        self._max_display_height = int(self._screen_size[1] * 0.85)  # 85% of screen (leave room for taskbar)
         
         logger.info(f"Localizer initialized - connecting to {config.host}:{config.port}")
         logger.info(f"Reference markers: {list(self.reference_markers.keys())}")
+        if config.display:
+            logger.info(f"Screen size: {self._screen_size}, max display: {self._max_display_width}x{self._max_display_height}")
     
     def _on_frame(self, frame: np.ndarray, metadata: Dict):
         """Process each received frame."""
@@ -326,6 +374,12 @@ class TurtleBotLocalizer:
             if not self._calibrated and self._homography_valid:
                 logger.info("Calibration complete - all reference markers detected")
                 self._calibrated = True
+                
+                # If plotter is enabled, disable display window
+                if self._plotter:
+                    self.config.display = False
+                    cv2.destroyAllWindows()
+                    logger.info("Display disabled - using plotter instead")
                 
                 # Load YOLO model now
                 if self._yolo_detector is None:
@@ -368,10 +422,10 @@ class TurtleBotLocalizer:
         
         # Step 5: Publish positions
         if self._sink:
-            # Build TurtleBot positions
+            # Build TurtleBot positions with M{id} naming
             positions = [
                 TurtleBotPosition(
-                    name=obj.name,
+                    name=f"M{obj.local_id}",
                     local_id=obj.local_id,
                     x=obj.smoothed_position[0],
                     y=obj.smoothed_position[1],
@@ -412,11 +466,33 @@ class TurtleBotLocalizer:
                 self._homography_valid
             )
         
-        # Step 6: Call user callback
+        # Step 6: Update plotter
+        if self._plotter and self._homography_valid:
+            for obj in tracked:
+                x, y, _ = obj.smoothed_position
+                self._plotter.update(
+                    label="BOT",
+                    beacon_id=obj.local_id,
+                    x=x,
+                    y=y,
+                    z=0.0
+                )
+            # Also plot reference markers
+            for marker_id, marker_cfg in self.reference_markers.items():
+                if marker_id in markers:
+                    self._plotter.update(
+                        label="REF",
+                        beacon_id=marker_cfg.r_index,
+                        x=marker_cfg.world_x,
+                        y=marker_cfg.world_y,
+                        z=0.0
+                    )
+        
+        # Step 7: Call user callback
         if self.on_pose_update and tracked:
             self.on_pose_update(tracked)
         
-        # Step 7: Display
+        # Step 8: Display
         if self.config.display:
             self._draw_frame(frame, markers, ref_markers_found, tracked)
     
@@ -443,11 +519,11 @@ class TurtleBotLocalizer:
         image_points = []
         world_points = []
         
-        for marker_id, world_pos in self.reference_markers.items():
+        for marker_id, marker_cfg in self.reference_markers.items():
             if marker_id in markers:
                 center = self.aruco_detector.get_center(markers[marker_id])
                 image_points.append(center)
-                world_points.append(world_pos)
+                world_points.append((marker_cfg.world_x, marker_cfg.world_y))
         
         if len(image_points) >= 4:
             image_pts = np.array(image_points, dtype=np.float32)
@@ -466,6 +542,57 @@ class TurtleBotLocalizer:
             return float(world[0, 0, 0]), float(world[0, 0, 1])
         return pixel_x, pixel_y
     
+    def _get_screen_size(self) -> tuple:
+        """Get screen size. Returns (width, height)."""
+        try:
+            # Try using tkinter (works on most systems)
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()  # Hide the window
+            width = root.winfo_screenwidth()
+            height = root.winfo_screenheight()
+            root.destroy()
+            return (width, height)
+        except Exception:
+            pass
+        
+        try:
+            # Try xrandr on Linux
+            import subprocess
+            output = subprocess.check_output(['xrandr']).decode('utf-8')
+            for line in output.split('\n'):
+                if '*' in line:  # Current resolution has asterisk
+                    parts = line.split()
+                    for part in parts:
+                        if 'x' in part and part[0].isdigit():
+                            w, h = part.split('x')
+                            return (int(w), int(h.split('+')[0]))
+        except Exception:
+            pass
+        
+        # Default fallback
+        return (1920, 1080)
+    
+    def _scale_to_fit(self, frame: np.ndarray) -> np.ndarray:
+        """Scale frame to fit within max display dimensions while maintaining aspect ratio."""
+        h, w = frame.shape[:2]
+        
+        # Check if scaling is needed
+        if w <= self._max_display_width and h <= self._max_display_height:
+            return frame
+        
+        # Calculate scale factor to fit within bounds
+        scale_w = self._max_display_width / w
+        scale_h = self._max_display_height / h
+        scale = min(scale_w, scale_h)
+        
+        # Calculate new dimensions
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize with high quality interpolation
+        return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     def _draw_calibration_frame(
         self,
         frame: np.ndarray,
@@ -500,6 +627,9 @@ class TurtleBotLocalizer:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         cv2.putText(output, needed_str, (10, 75),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Scale to fit screen
+        output = self._scale_to_fit(output)
         
         cv2.imshow(self._window_name, output)
         key = cv2.waitKey(1) & 0xFF
@@ -537,7 +667,7 @@ class TurtleBotLocalizer:
             if pos is None:
                 continue
             
-            color = colors[(obj.local_id - 1) % len(colors)]
+            color = colors[obj.local_id % len(colors)]
             px, py = pos.pixel_x, pos.pixel_y
             
             # Draw center point
@@ -547,9 +677,9 @@ class TurtleBotLocalizer:
             # Draw label
             x, y, _ = obj.smoothed_position
             if self._homography_valid:
-                label = f"{obj.name} (ID:{obj.local_id}): ({x:.2f}, {y:.2f})m"
+                label = f"M{obj.local_id}: ({x:.2f}, {y:.2f})m"
             else:
-                label = f"{obj.name} (ID:{obj.local_id}): ({px}, {py})px"
+                label = f"M{obj.local_id}: ({px}, {py})px"
             
             label += f" [{pos.confidence:.0%}]"
             
@@ -571,6 +701,9 @@ class TurtleBotLocalizer:
         cv2.rectangle(output, (0, h - 35), (w, h), (0, 0, 0), -1)
         cv2.putText(output, status, (10, h - 12),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Scale to fit screen
+        output = self._scale_to_fit(output)
         
         cv2.imshow(self._window_name, output)
         key = cv2.waitKey(1) & 0xFF
@@ -643,6 +776,9 @@ class TurtleBotLocalizer:
         
         if self._sink:
             self._sink.close()
+        
+        if self._plotter:
+            self._plotter.close()
         
         # Print statistics
         logger.info(f"Localizer stopped. Processed {self._frame_count} frames")
@@ -734,7 +870,7 @@ Controls (when display is enabled):
                        help="Path to JSON configuration file")
     parser.add_argument("--model", "-m", type=str,
                        help="Path to YOLO model (default: files/models/yolo/.../best.pt)")
-    parser.add_argument("--confidence", type=float, default=0.5,
+    parser.add_argument("--confidence", type=float, default=0.85,
                        help="Detection confidence threshold (default: 0.5)")
     parser.add_argument("--broadcast", "-b", action="store_true",
                        help="Enable position broadcasting")
@@ -744,6 +880,8 @@ Controls (when display is enabled):
                        help="Path to save CSV positions")
     parser.add_argument("--no-display", action="store_true",
                        help="Disable display window")
+    parser.add_argument("--plot", "-p", action="store_true",
+                       help="Enable position plotter (matplotlib)")
     parser.add_argument("--no-reconnect", action="store_true",
                        help="Disable auto-reconnect")
     parser.add_argument("--timeout", type=float, default=3.0,
@@ -789,7 +927,8 @@ Controls (when display is enabled):
     localizer = TurtleBotLocalizer(
         config=config,
         csv_path=args.csv,
-        broadcast=args.broadcast
+        broadcast=args.broadcast,
+        plot=args.plot
     )
     
     localizer.start(auto_reconnect=not args.no_reconnect)

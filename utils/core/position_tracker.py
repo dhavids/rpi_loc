@@ -102,7 +102,7 @@ class PositionTracker:
         self.use_pixel_association = use_pixel_association
         
         self._objects: Dict[int, TrackedObject] = {}
-        self._next_id = 1
+        self._next_id = 0  # 0-indexed: M0, M1, M2, ...
         self._frame_count = 0
     
     def update(
