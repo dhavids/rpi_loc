@@ -347,6 +347,7 @@ class TurtleBotLocalizer:
         self._frame_count = 0
         self._paused = False
         self._last_yolo_detections: List[Dict] = []  # Store for overlay drawing (only valid detections)
+        self._ref_marker_pixels: List[tuple] = []  # Cached reference marker pixel positions for YOLO filtering
         
         # Capture state
         self._capture_enabled = config.capture_images
@@ -385,13 +386,25 @@ class TurtleBotLocalizer:
             if self._sink:
                 self._sink.resume()
         
-        # Detect ArUco reference markers
-        markers = self.aruco_detector.detect(frame)
-        ref_markers_found = [mid for mid in markers if mid in self.reference_markers]
+        # Detect ArUco reference markers (skip if calibrated to save processing time)
+        # Only re-check markers periodically after calibration (every 60 frames ~= 4 seconds at 15fps)
+        markers = {}
+        ref_markers_found = []
         
-        # Update homography if enough markers
-        if len(ref_markers_found) >= self.config.min_reference_markers:
+        if not self._calibrated or (self._frame_count % 60 == 0):
+            markers = self.aruco_detector.detect(frame)
+            ref_markers_found = [mid for mid in markers if mid in self.reference_markers]
+        
+        # Update homography if enough markers (only when we did detection)
+        if markers and len(ref_markers_found) >= self.config.min_reference_markers:
             self._update_homography(markers)
+            
+            # Update cached reference marker pixel positions for YOLO filtering
+            self._ref_marker_pixels = []
+            for marker_id in markers:
+                if marker_id in self.reference_markers:
+                    px, py = self.aruco_detector.get_center(markers[marker_id])
+                    self._ref_marker_pixels.append((int(px), int(py)))
             
             # First time we have valid calibration
             if not self._calibrated and self._homography_valid:
@@ -425,21 +438,15 @@ class TurtleBotLocalizer:
         if self._yolo_detector:
             yolo_detections = self._yolo_detector.detect(frame)
             
-            # Get reference marker pixel positions for filtering
-            ref_marker_pixels = []
-            for marker_id in markers:
-                if marker_id in self.reference_markers:
-                    px, py = self.aruco_detector.get_center(markers[marker_id])
-                    ref_marker_pixels.append((int(px), int(py)))
-            
             # Transform to world coordinates and filter out detections near reference markers
+            # Uses cached _ref_marker_pixels which is updated periodically by ArUco detection
             for det in yolo_detections:
                 pixel_x, pixel_y = det["pixel_x"], det["pixel_y"]
                 
-                # Use 50 pixels as threshold - roughly the size of an ArUco marker
-                REF_MARKER_EXCLUSION_RADIUS = 60  # pixels
+                # Use 60 pixels as threshold - roughly the size of an ArUco marker
+                REF_MARKER_EXCLUSION_RADIUS = 70  # pixels
                 near_ref_marker = False
-                for ref_px, ref_py in ref_marker_pixels:
+                for ref_px, ref_py in self._ref_marker_pixels:
                     dist = np.sqrt((pixel_x - ref_px)**2 + (pixel_y - ref_py)**2)
                     if dist < REF_MARKER_EXCLUSION_RADIUS:
                         near_ref_marker = True
