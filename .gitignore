@@ -13,6 +13,10 @@ files/
 *.pt
 *.pth
 
+# Ignore data and runs folder
+data/
+runs/
+
 # Distribution / packaging
 .Python
 build/
